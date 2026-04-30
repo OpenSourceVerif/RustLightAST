@@ -19,12 +19,15 @@ pub enum Option {
     Rec(Box<Option>),
 }
 
-pub fn get(x0: &Option) -> Int {
+pub fn get 
+  (x0: Option) -> Int
+     {
     match x0 {
-        Option::Some(x) => x.clone(),
-        Option::None => Int::ZeroInt,
-        Option::Rec(op) => get(op.as_ref()),
+      Option::Some (x) => x.clone(), 
+      Option::None => Int::ZeroInt, 
+      Option::Rec (box op) => get(op.clone())
     }
-}
+  }
+
 
 fn main() {}
