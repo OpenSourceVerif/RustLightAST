@@ -1,0 +1,10 @@
+[package]
+ name = "isabelle_exported" 
+ version = "0.1.0" 
+ edition = "2024"
+
+[dependencies]
+
+[lints.rust] 
+ unused = "allow"
+ nonstandard_style = "allow"
