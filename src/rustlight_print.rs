@@ -1,5 +1,5 @@
 #![allow(clippy::only_used_in_recursion)]
-use crate::intermediate_ast::*;
+use crate::rustlight_ast::*;
 
 // Rust code generator
 pub struct RustCodeGenerator {
@@ -276,7 +276,7 @@ impl RustCodeGenerator {
 
         if let Some(expr) = &block.expr {
             self.generate_expr(expr);
-            self.writeln(";");
+            self.writeln("");
         }
     }
 
@@ -288,6 +288,7 @@ impl RustCodeGenerator {
 
         if let Some(expr) = &block.expr {
             self.generate_expr(expr);
+            self.writeln("");
             // The last expression in a match arm should never end with a semicolon, since it is the return value
         }
     }

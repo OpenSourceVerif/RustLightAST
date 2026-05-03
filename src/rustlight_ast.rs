@@ -1,4 +1,4 @@
-// crates/aadl_intermediate/src/intermediate_ast.rs
+// crates/rustlightast/src/rustlight_ast.rs
 
 /// Lightweight Rust abstract syntax tree (module level)
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ pub struct StructDef {
 #[derive(Debug, Clone)]
 pub struct UnionDef {
     pub name: String,
-    pub fields: Vec<Field>,            // union fields
+    pub fields: Vec<Field>, // union fields
     pub generics: Vec<GenericParam>,
     pub derives: Vec<String>, // #[derive(...)]
     pub docs: Vec<String>,

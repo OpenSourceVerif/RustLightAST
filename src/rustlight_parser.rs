@@ -1,19 +1,19 @@
 use proc_macro2::TokenStream;
 use syn::{
-    AngleBracketedGenericArguments, ExprArray, ExprAssign, ExprBinary, ExprBlock, ExprCall,
-    ExprField, ExprGroup, ExprIf, ExprIndex, ExprLit, ExprMatch, ExprMethodCall, ExprParen,
-    ExprPath, ExprReference, ExprTuple, ExprUnary, File, GenericArgument, ImplItem as SynImplItem,
-    Item as SynItem, Lit, LocalInit, Meta, Pat, PatIdent, PathArguments, ReturnType, Stmt,
-    Type as SynType, TypeArray, TypeGroup, TypeParen, TypeReference, TypeSlice,
-    TypeTuple, Visibility as SynVisibility, parse_file,
+    parse_file, AngleBracketedGenericArguments, ExprArray, ExprAssign, ExprBinary, ExprBlock,
+    ExprCall, ExprField, ExprGroup, ExprIf, ExprIndex, ExprLit, ExprMatch, ExprMethodCall,
+    ExprParen, ExprPath, ExprReference, ExprTuple, ExprUnary, File, GenericArgument,
+    ImplItem as SynImplItem, Item as SynItem, Lit, LocalInit, Meta, Pat, PatIdent, PathArguments,
+    ReturnType, Stmt, Type as SynType, TypeArray, TypeGroup, TypeParen, TypeReference, TypeSlice,
+    TypeTuple, Visibility as SynVisibility,
 };
 
-use crate::intermediate_ast::{
+use crate::rustlight_ast::{
     Attribute, AttributeArg, Block, ConstDef, EnumDef, Expr, Field, FunctionDef, GenericParam,
-    ImplBlock, ImplItem, Item, LetStmt, Literal, MatchArm, Param, PathType, RustModule,
-    Statement, StructDef, Type, TypeAlias, UnionDef, UseKind, UseStatement, Variant, Visibility,
+    ImplBlock, ImplItem, Item, LetStmt, Literal, MatchArm, Param, PathType, RustModule, Statement,
+    StructDef, Type, TypeAlias, UnionDef, UseKind, UseStatement, Variant, Visibility,
 };
-use crate::intermediate_print::RustCodeGenerator;
+use crate::rustlight_print::RustCodeGenerator;
 
 pub fn parse_rust_source(source: &str, module_name: impl Into<String>) -> syn::Result<RustModule> {
     let file = parse_file(source)?;
@@ -31,19 +31,25 @@ pub fn parse_and_print_rust_source(
 }
 
 fn convert_file(file: File, module_name: String) -> syn::Result<RustModule> {
-    let items = file
-        .items
+    let mut items = file
+        .attrs
         .iter()
-        .map(convert_item)
-        .collect::<syn::Result<Vec<_>>>()?;
+        .map(|attr| Item::Raw(attribute_to_raw_source(attr)))
+        .collect::<Vec<_>>();
+
+    items.extend(
+        file.items
+            .iter()
+            .map(convert_item)
+            .collect::<syn::Result<Vec<_>>>()?,
+    );
 
     Ok(RustModule {
         name: module_name,
-        docs: extract_docs(&file.attrs),
+        docs: Vec::new(),
         items,
-        attrs: convert_attributes(&file.attrs),
+        attrs: Vec::new(),
         vis: Visibility::Private,
-        withs: Vec::new(),
     })
 }
 
@@ -83,7 +89,6 @@ fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .iter()
                 .map(convert_field)
                 .collect::<syn::Result<Vec<_>>>()?,
-            properties: Vec::new(),
             generics: convert_generics(&item_struct.generics),
             derives: extract_derives(&item_struct.attrs),
             docs: extract_docs(&item_struct.attrs),
@@ -97,7 +102,6 @@ fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .iter()
                 .map(convert_field)
                 .collect::<syn::Result<Vec<_>>>()?,
-            properties: Vec::new(),
             generics: convert_generics(&item_union.generics),
             derives: extract_derives(&item_union.attrs),
             docs: extract_docs(&item_union.attrs),
@@ -131,6 +135,11 @@ fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .map(|(_, path, _)| convert_type_path(path))
                 .transpose()?,
         })),
+        SynItem::Mod(item_mod) if item_mod.content.is_none() => Ok(Item::Raw(format!(
+            "{}mod {};",
+            visibility_to_source(&convert_visibility(&item_mod.vis)),
+            item_mod.ident
+        ))),
         SynItem::Mod(item_mod) => {
             let nested_items = item_mod
                 .content
@@ -145,7 +154,6 @@ fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 items: nested_items,
                 attrs: convert_attributes(&item_mod.attrs),
                 vis: convert_visibility(&item_mod.vis),
-                withs: Vec::new(),
             })))
         }
         other => Err(syn::Error::new_spanned(
@@ -295,9 +303,7 @@ fn convert_type(ty: &SynType) -> syn::Result<Type> {
     match ty {
         SynType::Path(type_path) => convert_type_path(&type_path.path),
         SynType::Reference(TypeReference {
-            elem,
-            mutability,
-            ..
+            elem, mutability, ..
         }) => Ok(Type::Reference(
             Box::new(convert_type(elem)?),
             true,
@@ -359,7 +365,10 @@ fn convert_type_path(path: &syn::Path) -> syn::Result<Type> {
         Ok(Type::Generic(name, generic_args))
     } else if path.segments.len() > 1 {
         Ok(Type::Path(
-            path.segments.iter().map(|segment| segment.ident.to_string()).collect(),
+            path.segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect(),
         ))
     } else {
         Ok(Type::Named(name))
@@ -435,7 +444,9 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         syn::Expr::Path(ExprPath { path, .. }) => convert_expr_path(path),
         syn::Expr::Call(ExprCall { func, args, .. }) => Ok(Expr::Call(
             Box::new(convert_expr(func)?),
-            args.iter().map(convert_expr).collect::<syn::Result<Vec<_>>>()?,
+            args.iter()
+                .map(convert_expr)
+                .collect::<syn::Result<Vec<_>>>()?,
         )),
         syn::Expr::MethodCall(ExprMethodCall {
             receiver,
@@ -445,11 +456,16 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         }) => Ok(Expr::MethodCall(
             Box::new(convert_expr(receiver)?),
             method.to_string(),
-            args.iter().map(convert_expr).collect::<syn::Result<Vec<_>>>()?,
+            args.iter()
+                .map(convert_expr)
+                .collect::<syn::Result<Vec<_>>>()?,
         )),
         syn::Expr::Match(ExprMatch { expr, arms, .. }) => Ok(Expr::Match {
             expr: Box::new(convert_expr(expr)?),
-            arms: arms.iter().map(convert_match_arm).collect::<syn::Result<Vec<_>>>()?,
+            arms: arms
+                .iter()
+                .map(convert_match_arm)
+                .collect::<syn::Result<Vec<_>>>()?,
         }),
         syn::Expr::Block(ExprBlock { block, .. }) => Ok(Expr::Block(convert_block(block)?)),
         syn::Expr::Reference(ExprReference {
@@ -493,7 +509,10 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         syn::Expr::Lit(ExprLit { lit, .. }) => Ok(Expr::Literal(convert_literal(lit)?)),
         syn::Expr::Tuple(ExprTuple { elems, .. }) => Ok(Expr::Call(
             Box::new(Expr::Parenthesized(Box::new(Expr::Ident(String::new())))),
-            elems.iter().map(convert_expr).collect::<syn::Result<Vec<_>>>()?,
+            elems
+                .iter()
+                .map(convert_expr)
+                .collect::<syn::Result<Vec<_>>>()?,
         )),
         syn::Expr::Index(ExprIndex { expr, index, .. }) => Ok(Expr::Index(
             Box::new(convert_expr(expr)?),
@@ -506,7 +525,10 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         }
         syn::Expr::Array(ExprArray { elems, .. }) => Ok(Expr::Call(
             Box::new(Expr::Ident("vec!".to_string())),
-            elems.iter().map(convert_expr).collect::<syn::Result<Vec<_>>>()?,
+            elems
+                .iter()
+                .map(convert_expr)
+                .collect::<syn::Result<Vec<_>>>()?,
         )),
         other => Err(syn::Error::new_spanned(
             other,
@@ -621,6 +643,35 @@ fn convert_visibility(vis: &SynVisibility) -> Visibility {
     }
 }
 
+fn visibility_to_source(vis: &Visibility) -> String {
+    match vis {
+        Visibility::Public => "pub ".to_string(),
+        Visibility::Private | Visibility::None => String::new(),
+        Visibility::Restricted(path) => format!("pub(in {}) ", path.join("::")),
+    }
+}
+
+fn attribute_to_raw_source(attr: &syn::Attribute) -> String {
+    let marker = match attr.style {
+        syn::AttrStyle::Inner(_) => "#!",
+        syn::AttrStyle::Outer => "#",
+    };
+
+    match &attr.meta {
+        Meta::Path(path) => format!("{marker}[{}]", normalize_tokens(path.to_token_stream())),
+        Meta::NameValue(name_value) => format!(
+            "{marker}[{} = {}]",
+            normalize_tokens(name_value.path.to_token_stream()),
+            normalize_tokens(name_value.value.to_token_stream())
+        ),
+        Meta::List(list) => format!(
+            "{marker}[{}({})]",
+            normalize_tokens(list.path.to_token_stream()),
+            normalize_tokens(list.tokens.clone())
+        ),
+    }
+}
+
 fn convert_attributes(attrs: &[syn::Attribute]) -> Vec<Attribute> {
     attrs.iter().filter_map(convert_attribute).collect()
 }
@@ -667,8 +718,7 @@ fn extract_docs(attrs: &[syn::Attribute]) -> Vec<String> {
             match &attr.meta {
                 Meta::NameValue(name_value) => {
                     if let syn::Expr::Lit(ExprLit {
-                        lit: Lit::Str(doc),
-                        ..
+                        lit: Lit::Str(doc), ..
                     }) = &name_value.value
                     {
                         Some(format!("///{}", doc.value()))
@@ -733,18 +783,49 @@ where
 #[cfg(test)]
 mod tests {
     use super::parse_rust_source;
-    use crate::intermediate_ast::{Expr, Item, Type};
-    use crate::intermediate_print::RustCodeGenerator;
+    use crate::rustlight_ast::{Expr, Item, Type};
+    use crate::rustlight_print::RustCodeGenerator;
 
     #[test]
     fn parses_rec_get_sample_and_prints_it() {
-        let source = include_str!("../tests/Rec_Get_Tests.rs");
+        let source = r#"
+use crate::Int::*;
+
+#[derive(Clone)]
+pub enum Num {
+    One,
+    Bit0(Box<Num>),
+    Bit1(Box<Num>),
+}
+
+#[derive(Clone)]
+pub enum Int {
+    ZeroInt,
+    Pos(Num),
+    Neg(Num),
+}
+
+#[derive(Clone)]
+pub enum Option {
+    None,
+    Some(Int),
+    Rec(Box<Option>),
+}
+
+pub fn get(x0: Option) -> Int {
+    match x0 {
+        Option::Some(x) => x.clone(),
+        Option::None => Int::ZeroInt,
+        Option::Rec(box op) => get(op.clone()),
+    }
+}
+"#;
         let module = parse_rust_source(source, "Rec_Get_Tests").expect("sample parses");
 
         assert_eq!(module.name, "Rec_Get_Tests");
         assert_eq!(module.items.len(), 5);
 
-        match &module.items[0] {
+        match &module.items[1] {
             Item::Enum(def) => {
                 assert_eq!(def.name, "Num");
                 assert_eq!(def.variants.len(), 3);
@@ -760,7 +841,7 @@ mod tests {
             other => panic!("unexpected first item: {other:?}"),
         }
 
-        match &module.items[3] {
+        match &module.items[4] {
             Item::Function(def) => {
                 assert_eq!(def.name, "get");
                 assert_eq!(def.params.len(), 1);
@@ -769,7 +850,7 @@ mod tests {
                         Expr::Match { expr, arms } => {
                             assert!(matches!(expr.as_ref(), Expr::Ident(name) if name == "x0"));
                             assert_eq!(arms.len(), 3);
-                            assert_eq!(arms[2].pattern, "Option::Rec(op)");
+                            assert_eq!(arms[2].pattern, "Option::Rec(box op)");
                             match arms[2].body.expr.as_ref().expect("arm expr").as_ref() {
                                 Expr::Call(callee, args) => {
                                     assert!(matches!(
@@ -781,7 +862,7 @@ mod tests {
                                         &args[0],
                                         Expr::MethodCall(receiver, method, _)
                                         if matches!(receiver.as_ref(), Expr::Ident(name) if name == "op")
-                                            && method == "as_ref"
+                                            && method == "clone"
                                     ));
                                 }
                                 other => panic!("unexpected recursive arm body: {other:?}"),
@@ -798,9 +879,9 @@ mod tests {
         let mut generator = RustCodeGenerator::new();
         let printed = generator.generate_module_code(&module);
         assert!(printed.contains("enum Num"));
-        assert!(printed.contains("pub fn get(x0: &Option) -> Int"));
-        assert!(printed.contains("Option::Rec(op) => {"));
-        assert!(printed.contains("get(op.as_ref())"));
+        assert!(printed.contains("pub fn get(x0: Option) -> Int"));
+        assert!(printed.contains("Option::Rec(box op) => {"));
+        assert!(printed.contains("get(op.clone())"));
         assert!(!printed.is_empty());
     }
 }

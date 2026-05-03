@@ -1,10 +1,13 @@
 [package]
-name = "aadl_intermediate"
+name = "rustlightast"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "aadl_intermediate"
+name = "rustlightast"
 path = "src/lib.rs"
 
 [dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
