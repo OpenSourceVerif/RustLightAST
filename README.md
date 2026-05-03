@@ -21,7 +21,7 @@ cargo build --bin cargo-opt
 
 ### 2. Quick Start
 
-Place the Rust project to be optimized directly under the root:
+Place Rust test projects under `tests/`.
 
 There are two ways to run the optimizer.
 
@@ -31,26 +31,36 @@ There are two ways to run the optimizer.
 # go to the optimizer repository
 cd /YOUR-PATH/RustLightAST
 
-# optimize the input Rust project and generate Rust_Test/opt/
-cargo run --bin cargo-opt -- Rust_Test
+# optimize the input Rust project and generate tests/Rust_Test/opt/
+cargo run --bin cargo-opt -- tests/Rust_Test
 # run the optimized project
-cargo run --manifest-path Rust_Test/opt/Cargo.toml
+cargo run --manifest-path tests/Rust_Test/opt/Cargo.toml
 ```
 
 - Run from the test project directory
 
-This requires the input project to provide the Cargo aliases in `.cargo/config.toml`
+This requires the input project to provide the Cargo aliases in .cargo/config.toml
 
 ```toml
 [alias]
-opt = "run --manifest-path ../Cargo.toml --bin cargo-opt --"
+opt = "run --manifest-path ../../Cargo.toml --bin cargo-opt --"
 run-opt = "run --manifest-path opt/Cargo.toml"
 clean-opt = "clean --manifest-path opt/Cargo.toml"
+```
+To simplify setup, the repository provides Makefile targets for generating or
+removing these Cargo alias configurations automatically.
+```shell
+# To initialize or refresh all test projects
+make setup-tests
+# To initialize or refresh only one newly added project
+make setup-test PROJECT=tests/Rust_Test
+# To remove all generated test project Cargo alias configs:
+make clean-test-configs
 ```
 
 ```shell
 # go to the Rust project to be optimized
-cd /YOUR-PATH/RustLightAST/Rust_Test
+cd /YOUR-PATH/RustLightAST/tests/Rust_Test
 
 # generate optimized code into opt/
 cargo opt
@@ -72,12 +82,13 @@ RustLightAST/
 │   ├── rustlight_ast.rs         # lightweight Rust AST
 │   ├── rustlight_parser.rs      # Rust source code -> RustLightAST
 │   └── rustlight_print.rs       # RustLightAST -> Rust source code
-└── Rust_Test/                   # input Rust project to be optimized
-    ├── Cargo.toml
-    ├── src/                     # original Rust source code
-    └── opt/
+└── tests/
+    └── Rust_Test/               # input Rust project to be optimized
         ├── Cargo.toml
-        └── src/                 # optimized Rust source code
+        ├── src/                 # original Rust source code
+        └── opt/
+            ├── Cargo.toml
+            └── src/             # optimized Rust source code
 ```
 
 The optimization pipeline:

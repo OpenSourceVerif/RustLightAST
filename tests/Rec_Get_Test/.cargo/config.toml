@@ -1,0 +1,4 @@
+[alias]
+opt = "run --manifest-path ../../Cargo.toml --bin cargo-opt --"
+run-opt = "run --manifest-path opt/Cargo.toml"
+clean-opt = "clean --manifest-path opt/Cargo.toml"
