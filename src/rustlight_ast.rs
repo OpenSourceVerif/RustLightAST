@@ -128,6 +128,7 @@ pub enum Expr {
     Ident(String),
     Path(Vec<String>, PathType),
     Literal(Literal),
+    Tuple(Vec<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     MethodCall(Box<Expr>, String, Vec<Expr>),
     Block(Block),

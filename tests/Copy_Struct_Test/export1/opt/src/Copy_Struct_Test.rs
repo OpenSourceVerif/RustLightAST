@@ -1,4 +1,4 @@
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum FlagPair {
     FlagPair(bool, bool),
 }
@@ -6,7 +6,7 @@ pub enum FlagPair {
 pub fn get_left(x0: FlagPair) -> bool {
     match x0 {
         FlagPair::FlagPair(x, y) => {
-            x.clone()
+            x
         },
     }
 }
@@ -14,7 +14,7 @@ pub fn get_left(x0: FlagPair) -> bool {
 pub fn get_right(x0: FlagPair) -> bool {
     match x0 {
         FlagPair::FlagPair(x, y) => {
-            y.clone()
+            y
         },
     }
 }
@@ -22,7 +22,7 @@ pub fn get_right(x0: FlagPair) -> bool {
 pub fn swap_flag_pair(x0: FlagPair) -> FlagPair {
     match x0 {
         FlagPair::FlagPair(x, y) => {
-            FlagPair::FlagPair(y.clone(), x.clone())
+            FlagPair::FlagPair(y, x)
         },
     }
 }

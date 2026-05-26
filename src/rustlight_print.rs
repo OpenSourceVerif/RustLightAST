@@ -344,6 +344,19 @@ impl RustCodeGenerator {
                 }
             }
             Expr::Literal(lit) => self.generate_literal(lit),
+            Expr::Tuple(items) => {
+                self.write("(");
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.generate_expr(item);
+                }
+                if items.len() == 1 {
+                    self.write(",");
+                }
+                self.write(")");
+            }
             Expr::Call(callee, args) => {
                 self.generate_expr(callee);
                 self.write("(");

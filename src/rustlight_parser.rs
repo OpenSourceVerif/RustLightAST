@@ -507,8 +507,7 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 .transpose()?,
         }),
         syn::Expr::Lit(ExprLit { lit, .. }) => Ok(Expr::Literal(convert_literal(lit)?)),
-        syn::Expr::Tuple(ExprTuple { elems, .. }) => Ok(Expr::Call(
-            Box::new(Expr::Parenthesized(Box::new(Expr::Ident(String::new())))),
+        syn::Expr::Tuple(ExprTuple { elems, .. }) => Ok(Expr::Tuple(
             elems
                 .iter()
                 .map(convert_expr)

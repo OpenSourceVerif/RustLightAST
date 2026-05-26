@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use rustlightast::parse_and_print_rust_source;
+use rustlightast::{optimize_copy, parse_rust_source, RustCodeGenerator};
 
 const OPT_DIR_NAME: &str = "opt";
 
@@ -206,11 +206,14 @@ fn optimize_source_file(source_path: &Path, output_path: &Path) -> Result<bool, 
     let module_name = module_name_from_path(source_path);
     let needs_nightly = source.contains("#![feature(");
 
-    // Current opt pipeline: Rust source -> rustlight_ast::RustModule
-    // -> rustlight_print::RustCodeGenerator. Real optimization passes
-    // should be inserted between parsing and printing.
-    let (_, printed) = parse_and_print_rust_source(&source, module_name)
+    // Current opt pipeline: Rust source -> RustLightAST -> optimization passes
+    // -> rustlight_print::RustCodeGenerator.
+    let mut module = parse_rust_source(&source, module_name)
         .map_err(|err| format!("failed to parse {}: {err}", source_path.display()))?;
+    optimize_copy(&mut module);
+
+    let mut generator = RustCodeGenerator::new();
+    let printed = generator.generate_module_code(&module);
 
     write_file(output_path, printed.as_bytes())?;
     Ok(needs_nightly)
