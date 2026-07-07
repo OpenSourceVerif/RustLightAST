@@ -65,6 +65,7 @@ pub struct FunctionDef {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: Type,
+    pub generics: Vec<GenericParam>,
     pub body: Block,
     pub asyncness: bool,
     pub vis: Visibility,
@@ -108,12 +109,28 @@ pub enum Type {
     Path(Vec<String>),                // std::vec::Vec
     Named(String),                    // i32, String
     Generic(String, Vec<Type>),       // HashMap<K, V>
+    CallableTrait(CallableTraitType), // dyn Fn(A) -> B / impl Fn(A) -> B
     Reference(Box<Type>, bool, bool), // &mut T, first bool indicates reference, second bool indicates mutability
     Tuple(Vec<Type>),                 // (T1, T2)
     Slice(Box<Type>),                 // [T]
     Array(Box<Type>, usize),          // [T; N] fixed-size array
     Unit,                             // ()
     Never,                            // !
+}
+
+/// Callable trait type such as `dyn Fn(A) -> B` or `impl Fn(A) -> B`.
+#[derive(Debug, Clone)]
+pub struct CallableTraitType {
+    pub qualifier: CallableTraitQualifier,
+    pub trait_name: String,
+    pub args: Vec<Type>,
+    pub return_type: Box<Type>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CallableTraitQualifier {
+    Dyn,
+    Impl,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +143,8 @@ pub enum PathType {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Ident(String),
+    /// An opaque macro invocation preserved as Rust source, e.g. `panic!("msg")`.
+    Macro(String),
     Path(Vec<String>, PathType),
     Literal(Literal),
     Tuple(Vec<Expr>),
@@ -134,7 +153,8 @@ pub enum Expr {
     Block(Block),
     Loop(Box<Block>),
     Await(Box<Expr>),
-    Closure(Vec<String>, Box<Expr>),
+    /// `(params, body, is_move)` — third field is `true` for `move |…| …` closures.
+    Closure(Vec<String>, Box<Expr>, bool),
     BuilderChain(Vec<BuilderMethod>), // represents builder-style chained calls
     Unsafe(Box<Block>),               // unsafe expression support
     If {

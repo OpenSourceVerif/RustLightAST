@@ -1,6 +1,8 @@
 #![allow(clippy::only_used_in_recursion)]
 use crate::rustlight_ast::*;
 
+const MAX_FUNCTION_SIGNATURE_WIDTH: usize = 80;
+
 // Rust code generator
 pub struct RustCodeGenerator {
     buffer: String,
@@ -43,8 +45,11 @@ impl RustCodeGenerator {
 
     // Generate multiple items
     fn generate_items(&mut self, items: &[Item]) {
-        for item in items {
+        for (idx, item) in items.iter().enumerate() {
             self.generate_item(item);
+            if should_separate_after_use(item, items.get(idx + 1)) {
+                self.writeln("");
+            }
         }
     }
 
@@ -231,42 +236,106 @@ impl RustCodeGenerator {
             self.generate_attribute(attr);
         }
 
-        // Function signature
-        self.write(&format!(
-            "{}{}fn {}",
+        let head = format!(
+            "{}{}fn {}{}",
             self.visibility(&f.vis),
             if f.asyncness { "async " } else { "" },
-            f.name
-        ));
+            f.name,
+            self.generic_names_to_string(&f.generics)
+        );
+        let params_and_return = format!(
+            "({}) -> {}",
+            self.params_to_string(&f.params),
+            self.type_to_string(&f.return_type)
+        );
+        let signature = format!("{}{}", head, params_and_return);
+        let has_where_clause = f.generics.iter().any(|generic| !generic.bounds.is_empty());
 
-        // Parameters
-        self.write("(");
-        for (i, param) in f.params.iter().enumerate() {
-            if i > 0 {
-                self.write(", ");
-            }
-            if param.name.is_empty() {
-                self.write(&self.type_to_string(&param.ty));
+        if has_where_clause {
+            if signature.len() <= MAX_FUNCTION_SIGNATURE_WIDTH {
+                self.writeln(&signature);
             } else {
-                self.write(&format!(
-                    "{}: {}",
-                    param.name,
-                    self.type_to_string(&param.ty)
-                ));
+                self.writeln(&head);
+                self.indent();
+                self.writeln(&params_and_return);
+                self.dedent();
             }
+            self.generate_where_clause(&f.generics);
+            self.writeln("{");
+        } else if signature.len() <= MAX_FUNCTION_SIGNATURE_WIDTH {
+            self.writeln(&format!("{signature} {{"));
+        } else {
+            self.writeln(&head);
+            self.indent();
+            self.writeln(&format!("{params_and_return} {{"));
+            self.dedent();
         }
-        self.write(")");
 
-        // Return type
-        self.write(&format!(" -> {}", self.type_to_string(&f.return_type)));
-
-        // Function body
-        self.writeln(" {");
         self.indent();
         self.generate_block(&f.body);
         self.dedent();
         self.writeln("}");
         self.writeln("");
+    }
+
+    fn generic_names_to_string(&self, generics: &[GenericParam]) -> String {
+        if generics.is_empty() {
+            return String::new();
+        }
+
+        let mut out = String::from("<");
+        for (i, generic) in generics.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&generic.name);
+        }
+        out.push('>');
+        out
+    }
+
+    fn params_to_string(&self, params: &[Param]) -> String {
+        params
+            .iter()
+            .map(|param| self.param_to_string(param))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn param_to_string(&self, param: &Param) -> String {
+        if param.name.is_empty() {
+            self.type_to_string(&param.ty)
+        } else {
+            format!("{}: {}", param.name, self.type_to_string(&param.ty))
+        }
+    }
+
+    fn generate_where_clause(&mut self, generics: &[GenericParam]) {
+        let bounded_generics = generics
+            .iter()
+            .filter(|generic| !generic.bounds.is_empty())
+            .collect::<Vec<_>>();
+
+        if bounded_generics.is_empty() {
+            return;
+        }
+
+        self.writeln("where");
+        self.indent();
+        for (i, generic) in bounded_generics.iter().enumerate() {
+            let mut line = format!("{}: ", generic.name);
+            for (j, bound) in generic.bounds.iter().enumerate() {
+                if j > 0 {
+                    line.push_str(" + ");
+                }
+                line.push_str(bound);
+            }
+            if i + 1 < bounded_generics.len() {
+                line.push(',');
+            }
+            self.writeln(&line);
+        }
+        self.dedent();
     }
 
     fn generate_block(&mut self, block: &Block) {
@@ -330,6 +399,7 @@ impl RustCodeGenerator {
     fn generate_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Ident(id) => self.write(id),
+            Expr::Macro(source) => self.write(source),
             Expr::Path(path, path_type) => {
                 let separator = match path_type {
                     PathType::Namespace => "::",
@@ -424,7 +494,10 @@ impl RustCodeGenerator {
                     }
                 }
             }
-            Expr::Closure(params, body) => {
+            Expr::Closure(params, body, is_move) => {
+                if *is_move {
+                    self.write("move ");
+                }
                 self.write("|");
                 for (i, param) in params.iter().enumerate() {
                     if i > 0 {
@@ -741,6 +814,25 @@ impl RustCodeGenerator {
                 s.push('>');
                 s
             }
+            Type::CallableTrait(callable) => {
+                let qualifier = match callable.qualifier {
+                    CallableTraitQualifier::Dyn => "dyn",
+                    CallableTraitQualifier::Impl => "impl",
+                };
+                let args = callable
+                    .args
+                    .iter()
+                    .map(|arg| self.type_to_string(arg))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{} {}({}) -> {}",
+                    qualifier,
+                    callable.trait_name,
+                    args,
+                    self.type_to_string(&callable.return_type)
+                )
+            }
             Type::Reference(inner, is_reference, mutable) => {
                 format!(
                     "{}{}{}",
@@ -887,4 +979,16 @@ impl RustCodeGenerator {
             self.indent_level -= 1;
         }
     }
+}
+
+fn should_separate_after_use(item: &Item, next: Option<&Item>) -> bool {
+    match (item, next) {
+        (Item::Use(current), Some(Item::Use(next))) => use_root(current) != use_root(next),
+        (Item::Use(_), Some(_)) => true,
+        _ => false,
+    }
+}
+
+fn use_root(use_stmt: &UseStatement) -> Option<&str> {
+    use_stmt.path.first().map(String::as_str)
 }
