@@ -133,16 +133,7 @@ impl RustCodeGenerator {
                 if i > 0 {
                     self.write(", ");
                 }
-                self.write(&generic.name);
-                if !generic.bounds.is_empty() {
-                    self.write(": ");
-                    for (j, bound) in generic.bounds.iter().enumerate() {
-                        if j > 0 {
-                            self.write(" + ");
-                        }
-                        self.write(bound);
-                    }
-                }
+                self.write(&self.generic_param_to_string(generic));
             }
             self.writeln("> {");
         }
@@ -182,16 +173,7 @@ impl RustCodeGenerator {
                 if idx > 0 {
                     self.write(", ");
                 }
-                self.write(&generic.name);
-                if !generic.bounds.is_empty() {
-                    self.write(": ");
-                    for (j, bound) in generic.bounds.iter().enumerate() {
-                        if j > 0 {
-                            self.write(" + ");
-                        }
-                        self.write(bound);
-                    }
-                }
+                self.write(&self.generic_param_to_string(generic));
             }
             self.write(">");
         }
@@ -294,6 +276,18 @@ impl RustCodeGenerator {
         out
     }
 
+    fn generic_param_to_string(&self, generic: &GenericParam) -> String {
+        if generic.bounds.is_empty() {
+            generic.name.clone()
+        } else {
+            format!(
+                "{}: {}",
+                generic.name,
+                ordered_bounds_to_string(&generic.bounds)
+            )
+        }
+    }
+
     fn params_to_string(&self, params: &[Param]) -> String {
         params
             .iter()
@@ -311,10 +305,11 @@ impl RustCodeGenerator {
     }
 
     fn generate_where_clause(&mut self, generics: &[GenericParam]) {
-        let bounded_generics = generics
+        let mut bounded_generics = generics
             .iter()
             .filter(|generic| !generic.bounds.is_empty())
             .collect::<Vec<_>>();
+        bounded_generics.sort_by(|left, right| left.name.cmp(&right.name));
 
         if bounded_generics.is_empty() {
             return;
@@ -323,13 +318,11 @@ impl RustCodeGenerator {
         self.writeln("where");
         self.indent();
         for (i, generic) in bounded_generics.iter().enumerate() {
-            let mut line = format!("{}: ", generic.name);
-            for (j, bound) in generic.bounds.iter().enumerate() {
-                if j > 0 {
-                    line.push_str(" + ");
-                }
-                line.push_str(bound);
-            }
+            let mut line = format!(
+                "{}: {}",
+                generic.name,
+                ordered_bounds_to_string(&generic.bounds)
+            );
             if i + 1 < bounded_generics.len() {
                 line.push(',');
             }
@@ -696,16 +689,7 @@ impl RustCodeGenerator {
                 if i > 0 {
                     self.write(", ");
                 }
-                self.write(&generic.name);
-                if !generic.bounds.is_empty() {
-                    self.write(": ");
-                    for (j, bound) in generic.bounds.iter().enumerate() {
-                        if j > 0 {
-                            self.write(" + ");
-                        }
-                        self.write(bound);
-                    }
-                }
+                self.write(&self.generic_param_to_string(generic));
             }
             self.writeln("> {");
         }
@@ -931,16 +915,7 @@ impl RustCodeGenerator {
                 if i > 0 {
                     self.write(", ");
                 }
-                self.write(&generic.name);
-                if !generic.bounds.is_empty() {
-                    self.write(": ");
-                    for (j, bound) in generic.bounds.iter().enumerate() {
-                        if j > 0 {
-                            self.write(" + ");
-                        }
-                        self.write(bound);
-                    }
-                }
+                self.write(&self.generic_param_to_string(generic));
             }
             self.writeln("> {");
         }
@@ -991,4 +966,14 @@ fn should_separate_after_use(item: &Item, next: Option<&Item>) -> bool {
 
 fn use_root(use_stmt: &UseStatement) -> Option<&str> {
     use_stmt.path.first().map(String::as_str)
+}
+
+fn ordered_bounds_to_string(bounds: &[String]) -> String {
+    bounds
+        .iter()
+        .filter(|bound| bound.as_str() != "'static")
+        .chain(bounds.iter().filter(|bound| bound.as_str() == "'static"))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
