@@ -427,7 +427,7 @@ impl RustCodeGenerator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(arg);
+                    self.generate_call_argument(arg);
                 }
                 self.write(")");
             }
@@ -441,7 +441,7 @@ impl RustCodeGenerator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(arg);
+                    self.generate_call_argument(arg);
                 }
                 self.write(")");
             }
@@ -633,17 +633,45 @@ impl RustCodeGenerator {
                 self.write("]");
             }
             Expr::Parenthesized(expr) => {
-                self.write("(");
-                self.generate_expr(expr);
-                self.write(")");
+                if matches!(expr.as_ref(), Expr::Cast(_, _)) {
+                    self.generate_expr(expr);
+                } else {
+                    self.write("(");
+                    self.generate_expr(expr);
+                    self.write(")");
+                }
             }
             Expr::Cast(expr, ty) => {
-                self.write("(");
-                self.generate_expr(expr);
-                self.write(" as ");
-                self.write(&self.type_to_string(ty));
-                self.write(")");
+                self.generate_cast_expr(expr, ty, true);
             }
+        }
+    }
+
+    fn generate_call_argument(&mut self, expr: &Expr) {
+        if let Some((cast_expr, ty)) = Self::cast_expr_parts(expr) {
+            self.generate_cast_expr(cast_expr, ty, false);
+        } else {
+            self.generate_expr(expr);
+        }
+    }
+
+    fn cast_expr_parts(expr: &Expr) -> Option<(&Expr, &Type)> {
+        match expr {
+            Expr::Cast(cast_expr, ty) => Some((cast_expr, ty)),
+            Expr::Parenthesized(inner) => Self::cast_expr_parts(inner),
+            _ => None,
+        }
+    }
+
+    fn generate_cast_expr(&mut self, expr: &Expr, ty: &Type, parenthesized: bool) {
+        if parenthesized {
+            self.write("(");
+        }
+        self.generate_expr(expr);
+        self.write(" as ");
+        self.write(&self.type_to_string(ty));
+        if parenthesized {
+            self.write(")");
         }
     }
 
@@ -989,13 +1017,12 @@ fn ordered_bounds_to_string(bounds: &[String]) -> String {
 mod tests {
     use super::RustCodeGenerator;
     use crate::rustlight_ast::{
-        Block, CallableTraitQualifier, CallableTraitType, Expr, FunctionDef, Item, Param,
+        Block, CallableTraitQualifier, CallableTraitType, Expr, FunctionDef, Item, Param, PathType,
         RustModule, Type, Visibility,
     };
 
-    #[test]
-    fn prints_structured_cast_expression() {
-        let target = Type::Generic(
+    fn callable_target() -> Type {
+        Type::Generic(
             "Rc".to_string(),
             vec![Type::CallableTrait(CallableTraitType {
                 qualifier: CallableTraitQualifier::Dyn,
@@ -1003,7 +1030,10 @@ mod tests {
                 args: vec![Type::Named("Int".to_string())],
                 return_type: Box::new(Type::Named("Int".to_string())),
             })],
-        );
+        )
+    }
+
+    fn print_function_body(expr: Expr, target: Type) -> String {
         let module = RustModule {
             name: "Cast_Test".to_string(),
             docs: Vec::new(),
@@ -1017,10 +1047,7 @@ mod tests {
                 generics: Vec::new(),
                 body: Block {
                     stmts: Vec::new(),
-                    expr: Some(Box::new(Expr::Cast(
-                        Box::new(Expr::Ident("f".to_string())),
-                        target,
-                    ))),
+                    expr: Some(Box::new(expr)),
                 },
                 asyncness: false,
                 vis: Visibility::Public,
@@ -1031,7 +1058,51 @@ mod tests {
             vis: Visibility::Private,
         };
 
-        let printed = RustCodeGenerator::new().generate_module_code(&module);
+        RustCodeGenerator::new().generate_module_code(&module)
+    }
+
+    #[test]
+    fn prints_structured_cast_expression() {
+        let target = callable_target();
+        let printed = print_function_body(
+            Expr::Cast(Box::new(Expr::Ident("f".to_string())), target.clone()),
+            target,
+        );
         assert!(printed.contains("(f as Rc<dyn Fn(Int) -> Int>)"));
+    }
+
+    #[test]
+    fn avoids_duplicate_parentheses_around_cast() {
+        let target = callable_target();
+        let printed = print_function_body(
+            Expr::Parenthesized(Box::new(Expr::Cast(
+                Box::new(Expr::Ident("f".to_string())),
+                target.clone(),
+            ))),
+            target,
+        );
+        assert!(printed.contains("(f as Rc<dyn Fn(Int) -> Int>)"));
+        assert!(!printed.contains("((f as Rc<dyn Fn(Int) -> Int>))"));
+    }
+
+    #[test]
+    fn omits_outer_cast_parentheses_in_call_arguments() {
+        let target = callable_target();
+        let cast = Expr::Parenthesized(Box::new(Expr::Cast(
+            Box::new(Expr::Ident("f".to_string())),
+            target.clone(),
+        )));
+        let printed = print_function_body(
+            Expr::Call(
+                Box::new(Expr::Path(
+                    vec!["Reg".to_string(), "Reg".to_string()],
+                    PathType::Namespace,
+                )),
+                vec![cast],
+            ),
+            target,
+        );
+        assert!(printed.contains("Reg::Reg(f as Rc<dyn Fn(Int) -> Int>)"));
+        assert!(!printed.contains("Reg::Reg((f as Rc<dyn Fn(Int) -> Int>))"));
     }
 }
