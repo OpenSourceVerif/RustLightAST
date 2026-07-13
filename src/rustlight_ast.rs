@@ -177,6 +177,7 @@ pub enum Expr {
     UnaryOp(String, Box<Expr>),       // op expr, e.g., !x, -y
     Index(Box<Expr>, Box<Expr>),      // expr[index], e.g., array[i]
     Parenthesized(Box<Expr>),         // (expr), e.g., (a + b)
+    Cast(Box<Expr>, Type),            // expr as Type
     Assign(Box<Expr>, Box<Expr>), // left = right, e.g., state = State::S0 // lazy_static! macro support
 }
 

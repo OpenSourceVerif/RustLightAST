@@ -637,6 +637,13 @@ impl RustCodeGenerator {
                 self.generate_expr(expr);
                 self.write(")");
             }
+            Expr::Cast(expr, ty) => {
+                self.write("(");
+                self.generate_expr(expr);
+                self.write(" as ");
+                self.write(&self.type_to_string(ty));
+                self.write(")");
+            }
         }
     }
 
@@ -976,4 +983,55 @@ fn ordered_bounds_to_string(bounds: &[String]) -> String {
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" + ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RustCodeGenerator;
+    use crate::rustlight_ast::{
+        Block, CallableTraitQualifier, CallableTraitType, Expr, FunctionDef, Item, Param,
+        RustModule, Type, Visibility,
+    };
+
+    #[test]
+    fn prints_structured_cast_expression() {
+        let target = Type::Generic(
+            "Rc".to_string(),
+            vec![Type::CallableTrait(CallableTraitType {
+                qualifier: CallableTraitQualifier::Dyn,
+                trait_name: "Fn".to_string(),
+                args: vec![Type::Named("Int".to_string())],
+                return_type: Box::new(Type::Named("Int".to_string())),
+            })],
+        );
+        let module = RustModule {
+            name: "Cast_Test".to_string(),
+            docs: Vec::new(),
+            items: vec![Item::Function(FunctionDef {
+                name: "cast_closure".to_string(),
+                params: vec![Param {
+                    name: "f".to_string(),
+                    ty: target.clone(),
+                }],
+                return_type: target.clone(),
+                generics: Vec::new(),
+                body: Block {
+                    stmts: Vec::new(),
+                    expr: Some(Box::new(Expr::Cast(
+                        Box::new(Expr::Ident("f".to_string())),
+                        target,
+                    ))),
+                },
+                asyncness: false,
+                vis: Visibility::Public,
+                docs: Vec::new(),
+                attrs: Vec::new(),
+            })],
+            attrs: Vec::new(),
+            vis: Visibility::Private,
+        };
+
+        let printed = RustCodeGenerator::new().generate_module_code(&module);
+        assert!(printed.contains("(f as Rc<dyn Fn(Int) -> Int>)"));
+    }
 }
