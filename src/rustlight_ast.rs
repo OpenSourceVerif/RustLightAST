@@ -147,6 +147,7 @@ pub enum Expr {
     Macro(String),
     Path(Vec<String>, PathType),
     Literal(Literal),
+    Array(Vec<Expr>),
     Tuple(Vec<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     MethodCall(Box<Expr>, String, Vec<Expr>),
@@ -203,6 +204,9 @@ pub enum BuilderMethod {
 /// Literal
 #[derive(Debug, Clone)]
 pub enum Literal {
+    /// Literal source preserved verbatim when its spelling carries Rust type or
+    /// escaping information that must survive a parse/print round trip.
+    Raw(String),
     Int(i64),
     Float(f64),
     Str(String),

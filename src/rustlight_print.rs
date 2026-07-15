@@ -122,12 +122,13 @@ impl RustCodeGenerator {
             self.writeln(")]");
         }
 
+        let tuple_struct =
+            !s.fields.is_empty() && s.fields.iter().all(|field| field.name.is_empty());
+
         // Struct definition
         self.write(&format!("{}struct {} ", self.visibility(&s.vis), s.name));
 
-        if s.generics.is_empty() {
-            self.writeln("{");
-        } else {
+        if !s.generics.is_empty() {
             self.write("<");
             for (i, generic) in s.generics.iter().enumerate() {
                 if i > 0 {
@@ -135,8 +136,23 @@ impl RustCodeGenerator {
                 }
                 self.write(&self.generic_param_to_string(generic));
             }
-            self.writeln("> {");
+            self.write(">");
         }
+
+        if tuple_struct {
+            self.write("(");
+            for (i, field) in s.fields.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.write(&self.type_to_string(&field.ty));
+            }
+            self.writeln(");");
+            self.writeln("");
+            return;
+        }
+
+        self.writeln(" {");
 
         self.indent();
 
@@ -407,6 +423,16 @@ impl RustCodeGenerator {
                 }
             }
             Expr::Literal(lit) => self.generate_literal(lit),
+            Expr::Array(items) => {
+                self.write("[");
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.generate_expr(item);
+                }
+                self.write("]");
+            }
             Expr::Tuple(items) => {
                 self.write("(");
                 for (i, item) in items.iter().enumerate() {
@@ -569,12 +595,24 @@ impl RustCodeGenerator {
                 self.write("}");
 
                 if let Some(else_branch) = else_branch {
-                    self.write(" else ");
-                    self.writeln("{");
-                    self.indent();
-                    self.generate_block(else_branch);
-                    self.dedent();
-                    self.write("}");
+                    if else_branch.stmts.is_empty()
+                        && matches!(else_branch.expr.as_deref(), Some(Expr::If { .. }))
+                    {
+                        self.write(" else ");
+                        self.generate_expr(
+                            else_branch
+                                .expr
+                                .as_deref()
+                                .expect("checked nested if expression"),
+                        );
+                    } else {
+                        self.write(" else ");
+                        self.writeln("{");
+                        self.indent();
+                        self.generate_block(else_branch);
+                        self.dedent();
+                        self.write("}");
+                    }
                 }
             }
             Expr::IfLet {
@@ -608,7 +646,16 @@ impl RustCodeGenerator {
                 if *mutable {
                     self.write("mut ");
                 }
-                self.generate_expr(inner_expr);
+                if matches!(
+                    inner_expr.as_ref(),
+                    Expr::BinaryOp(_, _, _) | Expr::Assign(_, _) | Expr::Cast(_, _)
+                ) {
+                    self.write("(");
+                    self.generate_expr(inner_expr);
+                    self.write(")");
+                } else {
+                    self.generate_expr(inner_expr);
+                }
             }
             Expr::BinaryOp(left, op, right) => {
                 self.generate_expr(left);
@@ -677,6 +724,7 @@ impl RustCodeGenerator {
 
     fn generate_literal(&mut self, lit: &Literal) {
         match lit {
+            Literal::Raw(source) => self.write(source),
             Literal::Int(i) => self.write(&i.to_string()),
             Literal::Float(f) => self.write(&f.to_string()),
             Literal::Str(s) => self.write(&format!("\"{}\"", s)),
@@ -1017,8 +1065,8 @@ fn ordered_bounds_to_string(bounds: &[String]) -> String {
 mod tests {
     use super::RustCodeGenerator;
     use crate::rustlight_ast::{
-        Block, CallableTraitQualifier, CallableTraitType, Expr, FunctionDef, Item, Param, PathType,
-        RustModule, Type, Visibility,
+        Block, CallableTraitQualifier, CallableTraitType, Expr, FunctionDef, Item, Literal, Param,
+        PathType, RustModule, Type, Visibility,
     };
 
     fn callable_target() -> Type {
@@ -1104,5 +1152,49 @@ mod tests {
         );
         assert!(printed.contains("Reg::Reg(f as Rc<dyn Fn(Int) -> Int>)"));
         assert!(!printed.contains("Reg::Reg((f as Rc<dyn Fn(Int) -> Int>))"));
+    }
+
+    #[test]
+    fn parenthesizes_borrowed_binary_expressions() {
+        let printed = print_function_body(
+            Expr::Reference(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("n".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Literal(Literal::Int(1))),
+                )),
+                true,
+                false,
+            ),
+            Type::Named("BigInt".to_string()),
+        );
+        assert!(printed.contains("&(n + 1)"));
+    }
+
+    #[test]
+    fn prints_nested_else_if_without_an_extra_block() {
+        let bool_block = |value| Block {
+            stmts: Vec::new(),
+            expr: Some(Box::new(Expr::Literal(Literal::Bool(value)))),
+        };
+        let nested_if = Expr::If {
+            condition: Box::new(Expr::Ident("inner".to_string())),
+            then_branch: bool_block(true),
+            else_branch: Some(bool_block(false)),
+        };
+        let printed = print_function_body(
+            Expr::If {
+                condition: Box::new(Expr::Ident("outer".to_string())),
+                then_branch: bool_block(true),
+                else_branch: Some(Block {
+                    stmts: Vec::new(),
+                    expr: Some(Box::new(nested_if)),
+                }),
+            },
+            Type::Named("bool".to_string()),
+        );
+
+        assert!(printed.contains("} else if inner {"));
+        assert!(!printed.contains("} else {\n        if inner"));
     }
 }
