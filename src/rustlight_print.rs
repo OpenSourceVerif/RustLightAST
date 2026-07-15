@@ -534,6 +534,29 @@ impl RustCodeGenerator {
                     }
                 }
             }
+            Expr::TypedClosure(params, return_type, body, is_move) => {
+                if *is_move {
+                    self.write("move ");
+                }
+                self.write("|");
+                for (i, param) in params.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.write(param);
+                }
+                self.write("| -> ");
+                self.write(&self.type_to_string(return_type));
+                self.write(" ");
+                match body.as_ref() {
+                    Expr::Block(_) => self.generate_expr(body),
+                    _ => {
+                        self.write("{ ");
+                        self.generate_expr(body);
+                        self.write(" }");
+                    }
+                }
+            }
             Expr::Match { expr, arms } => {
                 self.write("match ");
                 self.generate_expr(expr);
@@ -1169,6 +1192,20 @@ mod tests {
             Type::Named("BigInt".to_string()),
         );
         assert!(printed.contains("&(n + 1)"));
+    }
+
+    #[test]
+    fn prints_explicit_closure_return_types() {
+        let printed = print_function_body(
+            Expr::TypedClosure(
+                vec!["x: Int".to_string()],
+                Type::Named("Pred<Unit>".to_string()),
+                Box::new(Expr::Macro("panic!(\"partial\")".to_string())),
+                true,
+            ),
+            callable_target(),
+        );
+        assert!(printed.contains("move |x: Int| -> Pred<Unit> { panic!(\"partial\") }"));
     }
 
     #[test]

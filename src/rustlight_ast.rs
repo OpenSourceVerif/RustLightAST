@@ -156,6 +156,8 @@ pub enum Expr {
     Await(Box<Expr>),
     /// `(params, body, is_move)` — third field is `true` for `move |…| …` closures.
     Closure(Vec<String>, Box<Expr>, bool),
+    /// A closure whose explicit Rust return type must survive parse/print.
+    TypedClosure(Vec<String>, Type, Box<Expr>, bool),
     BuilderChain(Vec<BuilderMethod>), // represents builder-style chained calls
     Unsafe(Box<Block>),               // unsafe expression support
     If {
