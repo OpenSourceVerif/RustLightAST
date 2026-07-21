@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "aadl_intermediate"
+name = "rustlightast"
 version = "0.1.0"
