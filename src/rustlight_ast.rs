@@ -192,6 +192,10 @@ pub enum Expr {
     MethodCall(Box<Expr>, String, Vec<Expr>),
     Block(Block),
     Loop(Box<Block>),
+    While {
+        condition: Box<Expr>,
+        body: Block,
+    },
     Await(Box<Expr>),
     /// `(params, body, is_move)` — third field is `true` for `move |…| …` closures.
     Closure(Vec<ClosureParam>, Box<Expr>, bool),
@@ -268,6 +272,7 @@ pub enum Statement {
     Let(LetStmt),
     Expr(Expr),
     Item(Box<Item>),
+    Return(Option<Expr>), // return; / return expr;
     Continue,        // continue statement
     Break,           // break statement
     Comment(String), // comment statement

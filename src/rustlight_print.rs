@@ -393,6 +393,14 @@ impl RustCodeGenerator {
                 self.writeln(";");
             }
             Statement::Item(item) => self.generate_item(item),
+            Statement::Return(value) => {
+                self.write("return");
+                if let Some(expr) = value {
+                    self.write(" ");
+                    self.generate_expr(expr);
+                }
+                self.writeln(";");
+            }
             Statement::Continue => {
                 self.writeln("continue;");
             }
@@ -482,6 +490,15 @@ impl RustCodeGenerator {
                 self.writeln("loop {");
                 self.indent();
                 self.generate_block(block);
+                self.dedent();
+                self.write("}");
+            }
+            Expr::While {condition, body} => {
+                self.write("while ");
+                self.generate_expr(condition);
+                self.writeln(" {");
+                self.indent();
+                self.generate_block(body);
                 self.dedent();
                 self.write("}");
             }
@@ -1118,7 +1135,8 @@ mod tests {
     use super::RustCodeGenerator;
     use crate::rustlight_ast::{
         Block, CallableTraitQualifier, CallableTraitType, ClosureParam, Expr, FunctionDef,
-        GenericParam, Item, Literal, Param, PathType, RustModule, Type, TypeAlias, Visibility,
+        GenericParam, Item, Literal, Param, PathType, RustModule, Statement, Type, TypeAlias,
+        Visibility,
     };
 
     fn callable_target() -> Type {
@@ -1309,6 +1327,60 @@ mod tests {
     }
 
     #[test]
+    fn prints_bare_return_statement() {
+        let module = RustModule {
+            name: "Return_Test".to_string(),
+            docs: Vec::new(),
+            items: vec![Item::Function(FunctionDef {
+                name: "early_exit".to_string(),
+                params: Vec::new(),
+                return_type: Type::Unit,
+                generics: Vec::new(),
+                body: Block {
+                    stmts: vec![Statement::Return(None)],
+                    expr: None,
+                },
+                asyncness: false,
+                vis: Visibility::Public,
+                docs: Vec::new(),
+                attrs: Vec::new(),
+            })],
+            attrs: Vec::new(),
+            vis: Visibility::Private,
+        };
+
+        let printed = RustCodeGenerator::new().generate_module_code(&module);
+        assert!(printed.contains("return;"));
+    }
+
+    #[test]
+    fn prints_return_statement_with_value() {
+        let module = RustModule {
+            name: "Return_Test".to_string(),
+            docs: Vec::new(),
+            items: vec![Item::Function(FunctionDef {
+                name: "return_value".to_string(),
+                params: Vec::new(),
+                return_type: Type::Named("Int".to_string()),
+                generics: Vec::new(),
+                body: Block {
+                    stmts: vec![Statement::Return(Some(Expr::Ident("value".to_string())))],
+                    expr: None,
+                },
+                asyncness: false,
+                vis: Visibility::Public,
+                docs: Vec::new(),
+                attrs: Vec::new(),
+            })],
+            attrs: Vec::new(),
+            vis: Visibility::Private,
+        };
+
+        let printed = RustCodeGenerator::new().generate_module_code(&module);
+        assert!(printed.contains("return value;"));
+    }
+
+    #[test]
     fn prints_nested_else_if_without_an_extra_block() {
         let bool_block = |value| Block {
             stmts: Vec::new(),
@@ -1333,5 +1405,25 @@ mod tests {
 
         assert!(printed.contains("} else if inner {"));
         assert!(!printed.contains("} else {\n        if inner"));
+    }
+
+    #[test]
+    fn prints_while_loop() {
+        let printed = print_function_body(
+            Expr::While {
+                condition: Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("i".to_string())),
+                    "<".to_string(),
+                    Box::new(Expr::Literal(Literal::Int(10))),
+                )),
+                body: Block {
+                    stmts: vec![Statement::Break],
+                    expr: None,
+                },
+            },
+            Type::Unit,
+        );
+
+        assert!(printed.contains("while i < 10 {\n        break;\n    }"));
     }
 }
