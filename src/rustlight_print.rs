@@ -137,16 +137,7 @@ impl RustCodeGenerator {
         // Struct definition
         self.write(&format!("{}struct {} ", self.visibility(&s.vis), s.name));
 
-        if !s.generics.is_empty() {
-            self.write("<");
-            for (i, generic) in s.generics.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
-                self.write(&self.generic_param_to_string(generic));
-            }
-            self.write(">");
-        }
+        self.write(&self.generic_params_to_string(&s.generics.params));
 
         if tuple_struct {
             self.write("(");
@@ -157,11 +148,14 @@ impl RustCodeGenerator {
                 self.write(&self.visibility(&field.vis));
                 self.write(&self.type_to_string(&field.ty));
             }
-            self.writeln(");");
+            self.write(")");
+            self.write_where_predicates(&s.generics.where_predicates);
+            self.writeln(";");
             self.writeln("");
             return;
         }
 
+        self.write_where_predicates(&s.generics.where_predicates);
         self.writeln(" {");
 
         self.indent();
@@ -193,26 +187,17 @@ impl RustCodeGenerator {
     fn generate_impl(&mut self, i: &ImplBlock) {
         self.write("impl");
 
-        // Generic parameters
-        if !i.generics.is_empty() {
-            self.write("<");
-            for (idx, generic) in i.generics.iter().enumerate() {
-                if idx > 0 {
-                    self.write(", ");
-                }
-                self.write(&self.generic_param_to_string(generic));
-            }
-            self.write(">");
-        }
+        self.write(&self.generic_params_to_string(&i.generics.params));
 
         // Trait implementation
         if let Some(trait_ty) = &i.trait_impl {
             self.write(&format!(" {} for", self.type_to_string(trait_ty)));
         }
         // Target type
-        self.write(&format!(" {} ", self.type_to_string(&i.target)));
+        self.write(&format!(" {}", self.type_to_string(&i.target)));
+        self.write_where_predicates(&i.generics.where_predicates);
 
-        self.writeln("{");
+        self.writeln(" {");
         self.indent();
 
         for item in &i.items {
@@ -250,7 +235,7 @@ impl RustCodeGenerator {
             self.visibility(&f.vis),
             if f.asyncness { "async " } else { "" },
             f.name,
-            self.generic_names_to_string(&f.generics)
+            self.generic_names_to_string(&f.generics.params)
         );
         let params_and_return = format!(
             "({}) -> {}",
@@ -258,13 +243,8 @@ impl RustCodeGenerator {
             self.type_to_string(&f.return_type)
         );
         let signature = format!("{}{}", head, params_and_return);
-        let has_where_clause = f
-            .generics
-            .iter()
-            .filter_map(GenericParam::type_parameter)
-            .any(|generic| !generic.bounds.is_empty());
-
-        if has_where_clause {
+        let where_clauses = self.function_where_clauses(&f.generics);
+        if !where_clauses.is_empty() {
             if signature.len() <= MAX_FUNCTION_SIGNATURE_WIDTH {
                 self.writeln(&signature);
             } else {
@@ -273,7 +253,13 @@ impl RustCodeGenerator {
                 self.writeln(&params_and_return);
                 self.dedent();
             }
-            self.generate_where_clause(&f.generics);
+            self.writeln("where");
+            self.indent();
+            for (position, clause) in where_clauses.iter().enumerate() {
+                let comma = if position + 1 < where_clauses.len() { "," } else { "" };
+                self.writeln(&format!("{clause}{comma}"));
+            }
+            self.dedent();
             self.writeln("{");
         } else if signature.len() <= MAX_FUNCTION_SIGNATURE_WIDTH {
             self.writeln(&format!("{signature} {{"));
@@ -331,32 +317,44 @@ impl RustCodeGenerator {
         }
     }
 
-    fn generate_where_clause(&mut self, generics: &[GenericParam]) {
+    fn function_where_clauses(&self, generics: &Generics) -> Vec<String> {
         let mut bounded_generics = generics
+            .params
             .iter()
             .filter_map(GenericParam::type_parameter)
             .filter(|generic| !generic.bounds.is_empty())
             .collect::<Vec<_>>();
         bounded_generics.sort_by(|left, right| left.name.cmp(&right.name));
+        bounded_generics
+            .into_iter()
+            .map(|param| format!("{}: {}", param.name, ordered_bounds_to_string(&param.bounds)))
+            .chain(
+                generics
+                    .where_predicates
+                    .iter()
+                    .map(|predicate| self.where_predicate_to_string(predicate)),
+            )
+            .collect()
+    }
 
-        if bounded_generics.is_empty() {
-            return;
-        }
+    fn where_predicate_to_string(&self, predicate: &WherePredicate) -> String {
+        let (subject, bounds) = match predicate {
+            WherePredicate::Type { subject, bounds } => (self.type_to_string(subject), bounds),
+            WherePredicate::Lifetime { subject, bounds } => (subject.clone(), bounds),
+        };
+        format!("{subject}: {}", ordered_bounds_to_string(bounds))
+    }
 
-        self.writeln("where");
-        self.indent();
-        for (i, generic) in bounded_generics.iter().enumerate() {
-            let mut line = format!(
-                "{}: {}",
-                generic.name,
-                ordered_bounds_to_string(&generic.bounds)
-            );
-            if i + 1 < bounded_generics.len() {
-                line.push(',');
+    fn write_where_predicates(&mut self, predicates: &[WherePredicate]) {
+        if !predicates.is_empty() {
+            self.write(" where ");
+            for (position, predicate) in predicates.iter().enumerate() {
+                if position > 0 {
+                    self.write(", ");
+                }
+                self.write(&self.where_predicate_to_string(predicate));
             }
-            self.writeln(&line);
         }
-        self.dedent();
     }
 
     fn generate_block(&mut self, block: &Block) {
@@ -921,13 +919,14 @@ impl RustCodeGenerator {
         for doc in &t.docs {
             self.writeln(doc);
         }
-        self.writeln(&format!(
-            "{}type {}{} = {};",
+        self.write(&format!(
+            "{}type {}{}",
             self.visibility(&t.vis),
             t.name,
-            self.generic_params_to_string(&t.generics),
-            self.type_to_string(&t.target)
+            self.generic_params_to_string(&t.generics.params),
         ));
+        self.write_where_predicates(&t.generics.where_predicates);
+        self.writeln(&format!(" = {};", self.type_to_string(&t.target)));
         self.writeln("");
     }
 
@@ -972,18 +971,9 @@ impl RustCodeGenerator {
 
         self.write(&format!("{}enum {} ", self.visibility(&e.vis), e.name));
 
-        if e.generics.is_empty() {
-            self.writeln("{");
-        } else {
-            self.write("<");
-            for (i, generic) in e.generics.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
-                self.write(&self.generic_param_to_string(generic));
-            }
-            self.writeln("> {");
-        }
+        self.write(&self.generic_params_to_string(&e.generics.params));
+        self.write_where_predicates(&e.generics.where_predicates);
+        self.writeln(" {");
 
         self.indent();
         for variant in &e.variants {
@@ -1080,6 +1070,17 @@ impl RustCodeGenerator {
                 }
                 s.push('>');
                 s
+            }
+            Type::ImplTrait {
+                trait_path,
+                associated_types,
+            } => {
+                let arguments = associated_types
+                    .iter()
+                    .map(|binding| format!("{} = {}", binding.name, self.type_to_string(&binding.ty)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("impl {}<{arguments}>", trait_path.join("::"))
             }
             Type::CallableTrait(callable) => {
                 let qualifier = match callable.qualifier {
@@ -1217,18 +1218,9 @@ impl RustCodeGenerator {
         // Union definition
         self.write(&format!("{}union {} ", self.visibility(&u.vis), u.name));
 
-        if u.generics.is_empty() {
-            self.writeln("{");
-        } else {
-            self.write("<");
-            for (i, generic) in u.generics.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
-                self.write(&self.generic_param_to_string(generic));
-            }
-            self.writeln("> {");
-        }
+        self.write(&self.generic_params_to_string(&u.generics.params));
+        self.write_where_predicates(&u.generics.where_predicates);
+        self.writeln(" {");
 
         self.indent();
 
@@ -1340,7 +1332,7 @@ mod tests {
                     mutable: false,
                 }],
                 return_type: target.clone(),
-                generics: Vec::new(),
+                generics: Default::default(),
                 body: Block {
                     stmts: Vec::new(),
                     expr: Some(Box::new(expr)),
@@ -1491,7 +1483,7 @@ mod tests {
                 generics: vec![GenericParam::Type(TypeParameter {
                     name: "T".to_string(),
                     bounds: vec!["Clone".to_string()],
-                })],
+                })].into(),
                 vis: Visibility::Public,
                 docs: Vec::new(),
             })],
@@ -1513,7 +1505,7 @@ mod tests {
                 name: "early_exit".to_string(),
                 params: Vec::new(),
                 return_type: Type::Unit,
-                generics: Vec::new(),
+                generics: Default::default(),
                 body: Block {
                     stmts: vec![Statement::Expr(Expr::Return(None))],
                     expr: None,
@@ -1540,7 +1532,7 @@ mod tests {
                 name: "return_value".to_string(),
                 params: Vec::new(),
                 return_type: Type::Named("Int".to_string()),
-                generics: Vec::new(),
+                generics: Default::default(),
                 body: Block {
                     stmts: vec![Statement::Expr(Expr::Return(Some(Box::new(Expr::Ident(
                         "value".to_string(),

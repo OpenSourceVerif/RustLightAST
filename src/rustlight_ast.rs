@@ -36,7 +36,7 @@ pub enum Item {
 pub struct StructDef {
     pub name: String,
     pub fields: Vec<Field>,
-    pub generics: Vec<GenericParam>,
+    pub generics: Generics,
     pub derives: Vec<String>, // #[derive(...)]
     pub docs: Vec<String>,
     pub vis: Visibility, // controls struct visibility
@@ -47,7 +47,7 @@ pub struct StructDef {
 pub struct UnionDef {
     pub name: String,
     pub fields: Vec<Field>, // union fields
-    pub generics: Vec<GenericParam>,
+    pub generics: Generics,
     pub derives: Vec<String>, // #[derive(...)]
     pub docs: Vec<String>,
     pub vis: Visibility, // controls union visibility
@@ -58,7 +58,7 @@ pub struct UnionDef {
 pub struct EnumDef {
     pub name: String,
     pub variants: Vec<Variant>,
-    pub generics: Vec<GenericParam>,
+    pub generics: Generics,
     pub derives: Vec<String>,
     pub docs: Vec<String>,
     pub vis: Visibility,
@@ -70,7 +70,7 @@ pub struct FunctionDef {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: Type,
-    pub generics: Vec<GenericParam>,
+    pub generics: Generics,
     pub body: Block,
     pub asyncness: bool,
     pub vis: Visibility,
@@ -82,7 +82,7 @@ pub struct FunctionDef {
 #[derive(Debug, Clone)]
 pub struct ImplBlock {
     pub target: Type,
-    pub generics: Vec<GenericParam>,
+    pub generics: Generics,
     pub items: Vec<ImplItem>,
     pub trait_impl: Option<Type>, // implemented for which trait
 }
@@ -102,7 +102,7 @@ pub struct ConstDef {
 pub struct TypeAlias {
     pub name: String,
     pub target: Type,
-    pub generics: Vec<GenericParam>,
+    pub generics: Generics,
     pub vis: Visibility,
     pub docs: Vec<String>,
 }
@@ -116,6 +116,10 @@ pub enum Type {
     Named(String),                    // i32, String
     Generic(String, Vec<Type>),       // HashMap<K, V>
     CallableTrait(CallableTraitType), // dyn Fn(A) -> B / impl Fn(A) -> B
+    ImplTrait {
+        trait_path: Vec<String>,
+        associated_types: Vec<AssociatedTypeBinding>,
+    },
     /// Reference target, optional explicit lifetime, and mutability.
     Reference(Box<Type>, Option<String>, bool),
     Tuple(Vec<Type>),                 // (T1, T2)
@@ -124,6 +128,12 @@ pub enum Type {
     Unit,                             // ()
     Never,                            // !
     Infer,                            // _
+}
+
+#[derive(Debug, Clone)]
+pub struct AssociatedTypeBinding {
+    pub name: String,
+    pub ty: Type,
 }
 
 /// Callable trait type such as `dyn Fn(A) -> B` or `impl Fn(A) -> B`.
@@ -442,6 +452,28 @@ pub struct Variant {
     pub name: String,
     pub data: Option<Vec<Type>>, // Some for tuple variant
     pub docs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Generics {
+    pub params: Vec<GenericParam>,
+    /// Constraints whose subjects are not parameters declared here.
+    pub where_predicates: Vec<WherePredicate>,
+}
+
+impl From<Vec<GenericParam>> for Generics {
+    fn from(params: Vec<GenericParam>) -> Self {
+        Self {
+            params,
+            where_predicates: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum WherePredicate {
+    Type { subject: Type, bounds: Vec<String> },
+    Lifetime { subject: String, bounds: Vec<String> },
 }
 
 #[derive(Debug, Clone)]

@@ -23,12 +23,13 @@ use syn::{
 #[cfg(test)]
 use crate::RustCodeGenerator;
 use crate::{
-    Attribute, AttributeArg, Block, CallableBound, CallableTraitQualifier, CallableTraitType, ClosureParam,
-    ConstDef, EnumDef, Expr, Field, FunctionDef, GenericParam, ImplBlock, ImplItem, Item, LetStmt,
+    AssociatedTypeBinding, Attribute, AttributeArg, Block, CallableBound, CallableTraitQualifier,
+    CallableTraitType, ClosureParam, ConstDef, EnumDef, Expr, Field, FunctionDef, GenericParam,
+    Generics, ImplBlock, ImplItem, Item, LetStmt,
     LifetimeParameter, Literal, MatchArm, Member, ModuleDecl, Param, PathType, RecordField,
     RustModule,
     Statement, StructDef, Type, TypeAlias, TypeParameter, UnionDef, UseKind, UseStatement, Variant,
-    Visibility,
+    Visibility, WherePredicate,
 };
 
 /// Marker attached to recovered function signatures with synthetic empty bodies.
@@ -108,7 +109,7 @@ pub fn convert_function_type_fact(item_fn: &syn::ItemFn) -> Option<FunctionDef> 
             .collect::<syn::Result<Vec<_>>>()
             .ok()?,
         return_type: convert_return_type(&item_fn.sig.output).ok()?,
-        generics: convert_generics(&item_fn.sig.generics),
+        generics: convert_generics(&item_fn.sig.generics).ok()?,
         body: Block {
             stmts: Vec::new(),
             expr: None,
@@ -165,7 +166,7 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .iter()
                 .map(convert_variant)
                 .collect::<syn::Result<Vec<_>>>()?,
-            generics: convert_generics(&item_enum.generics),
+            generics: convert_generics(&item_enum.generics)?,
             derives: extract_derives(&item_enum.attrs),
             docs: extract_docs(&item_enum.attrs),
             vis: convert_visibility(&item_enum.vis),
@@ -179,7 +180,7 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .map(convert_fn_arg)
                 .collect::<syn::Result<Vec<_>>>()?,
             return_type: convert_return_type(&item_fn.sig.output)?,
-            generics: convert_generics(&item_fn.sig.generics),
+            generics: convert_generics(&item_fn.sig.generics)?,
             body: convert_block(&item_fn.block)?,
             asyncness: item_fn.sig.asyncness.is_some(),
             vis: convert_visibility(&item_fn.vis),
@@ -193,7 +194,7 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .iter()
                 .map(convert_field)
                 .collect::<syn::Result<Vec<_>>>()?,
-            generics: convert_generics(&item_struct.generics),
+            generics: convert_generics(&item_struct.generics)?,
             derives: extract_derives(&item_struct.attrs),
             docs: extract_docs(&item_struct.attrs),
             vis: convert_visibility(&item_struct.vis),
@@ -206,7 +207,7 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .iter()
                 .map(convert_field)
                 .collect::<syn::Result<Vec<_>>>()?,
-            generics: convert_generics(&item_union.generics),
+            generics: convert_generics(&item_union.generics)?,
             derives: extract_derives(&item_union.attrs),
             docs: extract_docs(&item_union.attrs),
             vis: convert_visibility(&item_union.vis),
@@ -214,7 +215,7 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
         SynItem::Type(item_type) => Ok(Item::TypeAlias(TypeAlias {
             name: item_type.ident.to_string(),
             target: convert_type(&item_type.ty)?,
-            generics: convert_generics(&item_type.generics),
+            generics: convert_generics(&item_type.generics)?,
             vis: convert_visibility(&item_type.vis),
             docs: extract_docs(&item_type.attrs),
         })),
@@ -340,7 +341,7 @@ fn convert_fn_arg(arg: &syn::FnArg) -> syn::Result<Param> {
 pub fn convert_impl_header(item: &syn::ItemImpl) -> syn::Result<ImplBlock> {
     Ok(ImplBlock {
         target: convert_type(&item.self_ty)?,
-        generics: convert_generics(&item.generics),
+        generics: convert_generics(&item.generics)?,
         items: Vec::new(),
         trait_impl: item
             .trait_
@@ -361,10 +362,10 @@ fn convert_impl_item(item: &SynImplItem) -> syn::Result<ImplItem> {
                 .map(convert_fn_arg)
                 .collect::<syn::Result<Vec<_>>>()?,
             return_type: convert_return_type(&method.sig.output)?,
-            generics: convert_generics(&method.sig.generics),
+            generics: convert_generics(&method.sig.generics)?,
             body: convert_block(&method.block)?,
             asyncness: method.sig.asyncness.is_some(),
-            vis: Visibility::None,
+            vis: convert_visibility(&method.vis),
             docs: extract_docs(&method.attrs),
             attrs: convert_attributes(&method.attrs),
         })),
@@ -468,6 +469,11 @@ fn convert_type(ty: &SynType) -> syn::Result<Type> {
             convert_callable_trait_bounds(bounds.iter(), CallableTraitQualifier::Dyn)
         }
         SynType::ImplTrait(TypeImplTrait { bounds, .. }) => {
+            if let (Some(TypeParamBound::Trait(bound)), 1) = (bounds.first(), bounds.len()) {
+                if let Some(opaque) = convert_associated_impl_trait(bound)? {
+                    return Ok(opaque);
+                }
+            }
             convert_callable_trait_bounds(bounds.iter(), CallableTraitQualifier::Impl)
         }
         SynType::Never(_) => Ok(Type::Never),
@@ -480,6 +486,41 @@ fn convert_type(ty: &SynType) -> syn::Result<Type> {
             "unsupported type syntax in RustLightAST parser",
         )),
     }
+}
+
+fn convert_associated_impl_trait(bound: &TraitBound) -> syn::Result<Option<Type>> {
+    if bound.lifetimes.is_some() || !matches!(bound.modifier, syn::TraitBoundModifier::None) {
+        return Ok(None);
+    }
+    let mut segments = bound.path.segments.iter();
+    let Some(last) = segments.next_back() else {
+        return Ok(None);
+    };
+    let PathArguments::AngleBracketed(arguments) = &last.arguments else {
+        return Ok(None);
+    };
+    if arguments.args.is_empty() || segments.any(|segment| !segment.arguments.is_none()) {
+        return Ok(None);
+    }
+    let mut associated_types = Vec::new();
+    for argument in &arguments.args {
+        let GenericArgument::AssocType(assoc) = argument else {
+            return Ok(None);
+        };
+        if assoc.generics.is_some() {
+            return Ok(None);
+        }
+        associated_types.push(AssociatedTypeBinding {
+            name: assoc.ident.to_string(),
+            ty: convert_type(&assoc.ty)?,
+        });
+    }
+    let mut trait_path = bound_path_segments(&bound.path, bound.path.segments.len() - 1);
+    trait_path.push(last.ident.to_string());
+    Ok(Some(Type::ImplTrait {
+        trait_path,
+        associated_types,
+    }))
 }
 
 fn convert_callable_trait_bounds<'a>(
@@ -516,7 +557,7 @@ fn convert_callable_trait_bounds<'a>(
                     return Err(syn::Error::new_spanned(bound, "unsupported callable trait bound"));
                 }
                 clone = true;
-                CallableBound::Trait(callable_bound_path(path, path.segments.len()))
+                CallableBound::Trait(bound_path_segments(path, path.segments.len()))
             }
             _ => return Err(syn::Error::new_spanned(bound, "unsupported callable trait bound")),
         };
@@ -560,7 +601,7 @@ fn convert_callable_trait_bound(
         ));
     };
     let mut trait_path =
-        callable_bound_path(&trait_bound.path, trait_bound.path.segments.len() - 1);
+        bound_path_segments(&trait_bound.path, trait_bound.path.segments.len() - 1);
     trait_path.push(last.ident.to_string());
 
     let args = inputs
@@ -588,7 +629,7 @@ fn convert_callable_trait_bound(
     }))
 }
 
-fn callable_bound_path(path: &syn::Path, segments: usize) -> Vec<String> {
+fn bound_path_segments(path: &syn::Path, segments: usize) -> Vec<String> {
     path.leading_colon
         .iter()
         .map(|_| String::new())
@@ -1097,7 +1138,7 @@ fn convert_literal(lit: &Lit) -> syn::Result<Literal> {
     }
 }
 
-fn convert_generics(generics: &syn::Generics) -> Vec<GenericParam> {
+fn convert_generics(generics: &syn::Generics) -> syn::Result<Generics> {
     let mut params = generics
         .params
         .iter()
@@ -1116,34 +1157,71 @@ fn convert_generics(generics: &syn::Generics) -> Vec<GenericParam> {
             _ => None,
         })
         .collect::<Vec<_>>();
+    let mut where_predicates = Vec::new();
 
-    if let Some(where_clause) = &generics.where_clause {
-        for predicate in &where_clause.predicates {
-            let syn::WherePredicate::Type(predicate) = predicate else {
-                continue;
-            };
-            let SynType::Path(type_path) = &predicate.bounded_ty else {
-                continue;
-            };
-            if type_path.path.segments.len() != 1 {
-                continue;
-            }
-
-            let name = type_path.path.segments[0].ident.to_string();
-            if let Some(param) = params.iter_mut().filter_map(GenericParam::type_parameter_mut)
-                .find(|param| param.name == name)
-            {
-                for bound in &predicate.bounds {
-                    let bound = normalize_tokens(bound.to_token_stream());
-                    if !param.bounds.iter().any(|existing| existing == &bound) {
-                        param.bounds.push(bound);
+    if let Some(clause) = &generics.where_clause {
+        for predicate in &clause.predicates {
+            match predicate {
+                syn::WherePredicate::Type(predicate) if predicate.lifetimes.is_none() => {
+                    let bounds = predicate
+                        .bounds
+                        .iter()
+                        .map(|bound| normalize_tokens(bound.to_token_stream()))
+                        .collect();
+                    let local_parameter = match &predicate.bounded_ty {
+                        SynType::Path(path) if path.qself.is_none() => path.path.get_ident(),
+                        _ => None,
                     }
+                    .and_then(|name| {
+                        params
+                            .iter_mut()
+                            .filter_map(GenericParam::type_parameter_mut)
+                            .find(|param| *name == param.name)
+                    });
+                    if let Some(parameter) = local_parameter {
+                        extend_bounds(&mut parameter.bounds, bounds);
+                    } else {
+                        where_predicates.push(WherePredicate::Type {
+                            subject: convert_type(&predicate.bounded_ty)?,
+                            bounds,
+                        });
+                    }
+                }
+                syn::WherePredicate::Lifetime(predicate) => {
+                    let subject = predicate.lifetime.to_string();
+                    let bounds = predicate.bounds.iter().map(ToString::to_string).collect();
+                    let parameter = params.iter_mut().find_map(|param| match param {
+                        GenericParam::Lifetime(param) if param.name == subject => Some(param),
+                        _ => None,
+                    });
+                    if let Some(parameter) = parameter {
+                        extend_bounds(&mut parameter.bounds, bounds);
+                    } else {
+                        where_predicates.push(WherePredicate::Lifetime { subject, bounds });
+                    }
+                }
+                unsupported => {
+                    return Err(syn::Error::new_spanned(
+                        unsupported,
+                        "unsupported where predicate in RustLightAST parser",
+                    ));
                 }
             }
         }
     }
 
-    params
+    Ok(Generics {
+        params,
+        where_predicates,
+    })
+}
+
+fn extend_bounds(bounds: &mut Vec<String>, additional: Vec<String>) {
+    for bound in additional {
+        if !bounds.contains(&bound) {
+            bounds.push(bound);
+        }
+    }
 }
 
 fn convert_lifetime_param(param: &syn::LifetimeParam) -> LifetimeParameter {

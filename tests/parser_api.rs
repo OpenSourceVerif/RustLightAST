@@ -230,3 +230,39 @@ fn parameter_reassignment_retains_the_mutable_binding() {
     assert!(printed.contains("advance(mut value: u32, _: u32)"));
     parse_rust_source(&printed, "roundtrip").unwrap();
 }
+
+#[test]
+fn where_bounds_on_parameters_and_instantiated_types_survive_printing() {
+    let source = r#"
+        fn describe<T>(value: Vec<T>) -> String
+        where
+            T: Clone,
+            Vec<T>: std::fmt::Debug,
+        {
+            format!("{value:?}")
+        }
+    "#;
+    let module = parse_rust_source(source, "where_bounds").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    assert!(printed.contains("T: Clone"));
+    assert!(printed.contains("Vec<T>: std::fmt::Debug"));
+    parse_rust_source(&printed, "roundtrip").unwrap();
+}
+
+#[test]
+fn iterator_opaque_types_keep_the_associated_item_type() {
+    let source = r#"
+        fn list<T>(values: impl IntoIterator<Item = T>) -> Vec<T> {
+            values.into_iter().collect()
+        }
+
+        fn iter<'a, T>(values: &'a [T]) -> impl Iterator<Item = &'a T> {
+            values.iter()
+        }
+    "#;
+    let module = parse_rust_source(source, "iterator_types").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    assert!(printed.contains("impl IntoIterator<Item = T>"));
+    assert!(printed.contains("impl Iterator<Item = &'a T>"));
+    parse_rust_source(&printed, "roundtrip").unwrap();
+}
