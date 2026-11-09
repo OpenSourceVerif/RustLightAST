@@ -25,8 +25,9 @@ use crate::RustCodeGenerator;
 use crate::{
     Attribute, AttributeArg, Block, CallableBound, CallableTraitQualifier, CallableTraitType, ClosureParam,
     ConstDef, EnumDef, Expr, Field, FunctionDef, GenericParam, ImplBlock, ImplItem, Item, LetStmt,
-    Literal, MatchArm, Member, Param, PathType, RecordField, RustModule, Statement, StructDef, Type,
-    TypeAlias, UnionDef, UseKind, UseStatement, Variant, Visibility,
+    LifetimeParameter, Literal, MatchArm, Member, Param, PathType, RecordField, RustModule,
+    Statement, StructDef, Type, TypeAlias, TypeParameter, UnionDef, UseKind, UseStatement, Variant,
+    Visibility,
 };
 
 /// Marker attached to recovered function signatures with synthetic empty bodies.
@@ -308,11 +309,29 @@ fn convert_fn_arg(arg: &syn::FnArg) -> syn::Result<Param> {
         syn::FnArg::Receiver(receiver) => Ok(Param {
             name: "self".to_string(),
             ty: convert_type(&receiver.ty)?,
+            mutable: receiver.reference.is_none() && receiver.mutability.is_some(),
         }),
-        syn::FnArg::Typed(pat_type) => Ok(Param {
-            name: convert_pat_name(&pat_type.pat)?,
-            ty: convert_type(&pat_type.ty)?,
-        }),
+        syn::FnArg::Typed(parameter) => {
+            let Pat::Ident(binding) = parameter.pat.as_ref() else {
+                return Err(syn::Error::new_spanned(
+                    &parameter.pat,
+                    "unsupported parameter pattern in RustLightAST parser",
+                ));
+            };
+            // DEFENSE: ref changes the binding's type; @ introduces a pattern
+            // that a single named parameter cannot carry.
+            if binding.by_ref.is_some() || binding.subpat.is_some() {
+                return Err(syn::Error::new_spanned(
+                    binding,
+                    "unsupported ref or @ function parameter binding in RustLightAST parser",
+                ));
+            }
+            Ok(Param {
+                name: binding.ident.to_string(),
+                ty: convert_type(&parameter.ty)?,
+                mutable: binding.mutability.is_some(),
+            })
+        }
     }
 }
 
@@ -420,10 +439,10 @@ fn convert_type(ty: &SynType) -> syn::Result<Type> {
             convert_type_path(&type_path.path)
         }
         SynType::Reference(TypeReference {
-            elem, mutability, ..
+            elem, lifetime, mutability, ..
         }) => Ok(Type::Reference(
             Box::new(convert_type(elem)?),
-            true,
+            lifetime.as_ref().map(ToString::to_string),
             mutability.is_some(),
         )),
         SynType::Tuple(TypeTuple { elems, .. }) => {
@@ -547,6 +566,15 @@ fn convert_callable_trait_bound(
         .map(convert_type)
         .collect::<syn::Result<Vec<_>>>()?;
     let return_type = Box::new(convert_return_type(output)?);
+    let higher_ranked = trait_bound
+        .lifetimes
+        .iter()
+        .flat_map(|binder| &binder.lifetimes)
+        .filter_map(|param| match param {
+            syn::GenericParam::Lifetime(param) => Some(convert_lifetime_param(param)),
+            _ => None,
+        })
+        .collect();
     Ok(Type::CallableTrait(CallableTraitType {
         qualifier,
         trait_path,
@@ -554,6 +582,7 @@ fn convert_callable_trait_bound(
         return_type,
         leading_bounds,
         trailing_bounds,
+        higher_ranked,
     }))
 }
 
@@ -739,7 +768,49 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 .map(convert_match_arm)
                 .collect::<syn::Result<Vec<_>>>()?,
         }),
-        syn::Expr::Block(ExprBlock { block, .. }) => Ok(Expr::Block(convert_block(block)?)),
+        syn::Expr::Block(ExprBlock { label, block, .. }) => {
+            ensure_unlabeled(label.as_ref())?;
+            Ok(Expr::Block(convert_block(block)?))
+        }
+        syn::Expr::Loop(expr) => {
+            ensure_unlabeled(expr.label.as_ref())?;
+            Ok(Expr::Loop(Box::new(convert_block(&expr.body)?)))
+        }
+        syn::Expr::While(expr) => {
+            ensure_unlabeled(expr.label.as_ref())?;
+            let condition = match expr.cond.as_ref() {
+                syn::Expr::Let(condition) => Expr::Let {
+                    pattern: pattern::convert_pattern(&condition.pat)?,
+                    value: Box::new(convert_expr(&condition.expr)?),
+                },
+                condition => convert_expr(condition)?,
+            };
+            Ok(Expr::While {
+                condition: Box::new(condition),
+                body: convert_block(&expr.body)?,
+            })
+        }
+        syn::Expr::ForLoop(expr) => {
+            ensure_unlabeled(expr.label.as_ref())?;
+            Ok(Expr::For {
+                pattern: pattern::convert_pattern(&expr.pat)?,
+                iter: Box::new(convert_expr(&expr.expr)?),
+                body: convert_block(&expr.body)?,
+            })
+        }
+        syn::Expr::Return(expr) => Ok(Expr::Return(
+            expr.expr.as_deref().map(convert_expr).transpose()?.map(Box::new),
+        )),
+        syn::Expr::Break(expr) => {
+            ensure_unlabeled(expr.label.as_ref())?;
+            Ok(Expr::Break(
+                expr.expr.as_deref().map(convert_expr).transpose()?.map(Box::new),
+            ))
+        }
+        syn::Expr::Continue(expr) => {
+            ensure_unlabeled(expr.label.as_ref())?;
+            Ok(Expr::Continue)
+        }
         syn::Expr::Reference(ExprReference {
             expr, mutability, ..
         }) => Ok(Expr::Reference(
@@ -749,6 +820,25 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         )),
         syn::Expr::Cast(ExprCast { expr, ty, .. }) => {
             Ok(Expr::Cast(Box::new(convert_expr(expr)?), convert_type(ty)?))
+        }
+        syn::Expr::Try(expr) => Ok(Expr::Try(Box::new(convert_expr(&expr.expr)?))),
+        syn::Expr::Repeat(expr) => Ok(Expr::Repeat {
+            value: Box::new(convert_expr(&expr.expr)?),
+            len: Box::new(convert_expr(&expr.len)?),
+        }),
+        syn::Expr::Range(expr) => {
+            let bound = |bound: Option<&syn::Expr>| {
+                bound.map(|bound| convert_expr(bound).map(Box::new)).transpose()
+            };
+            let start = bound(expr.start.as_deref())?;
+            let end = bound(expr.end.as_deref())?;
+            let end = match expr.limits {
+                syn::RangeLimits::HalfOpen(_) => crate::RangeEnd::Exclusive(end),
+                syn::RangeLimits::Closed(_) => crate::RangeEnd::Inclusive(end.ok_or_else(|| {
+                    syn::Error::new_spanned(expr, "inclusive range requires an end expression")
+                })?),
+            };
+            Ok(Expr::Range { start, end })
         }
         syn::Expr::Paren(ExprParen { expr, .. }) | syn::Expr::Group(ExprGroup { expr, .. }) => {
             Ok(Expr::Parenthesized(Box::new(convert_expr(expr)?)))
@@ -773,14 +863,26 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
             then_branch,
             else_branch,
             ..
-        }) => Ok(Expr::If {
-            condition: Box::new(convert_expr(cond)?),
-            then_branch: convert_block(then_branch)?,
-            else_branch: else_branch
+        }) => {
+            let then_branch = convert_block(then_branch)?;
+            let else_branch = else_branch
                 .as_ref()
                 .map(|(_, expr)| expr_to_block(expr))
-                .transpose()?,
-        }),
+                .transpose()?;
+            match cond.as_ref() {
+                syn::Expr::Let(condition) => Ok(Expr::IfLet {
+                    pattern: normalize_tokens(condition.pat.to_token_stream()),
+                    value: Box::new(convert_expr(&condition.expr)?),
+                    then_branch,
+                    else_branch,
+                }),
+                condition => Ok(Expr::If {
+                    condition: Box::new(convert_expr(condition)?),
+                    then_branch,
+                    else_branch,
+                }),
+            }
+        }
         syn::Expr::Lit(ExprLit { lit, .. }) => Ok(Expr::Literal(convert_literal(lit)?)),
         syn::Expr::Tuple(ExprTuple { elems, .. }) => Ok(Expr::Tuple(
             elems
@@ -857,6 +959,13 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
     }
 }
 
+fn ensure_unlabeled(label: Option<&impl quote::ToTokens>) -> syn::Result<()> {
+    match label {
+        Some(label) => Err(syn::Error::new_spanned(label, "unsupported expression label")),
+        None => Ok(()),
+    }
+}
+
 fn convert_closure_param(pattern: &syn::Pat) -> syn::Result<ClosureParam> {
     match pattern {
         syn::Pat::Type(typed) => Ok(ClosureParam::typed(
@@ -871,7 +980,10 @@ fn convert_closure_param(pattern: &syn::Pat) -> syn::Result<ClosureParam> {
 
 fn expr_to_block(expr: &syn::Expr) -> syn::Result<Block> {
     match expr {
-        syn::Expr::Block(ExprBlock { block, .. }) => convert_block(block),
+        syn::Expr::Block(ExprBlock { label, block, .. }) => {
+            ensure_unlabeled(label.as_ref())?;
+            convert_block(block)
+        }
         syn::Expr::If(expr_if) => Ok(Block {
             stmts: Vec::new(),
             expr: Some(Box::new(convert_expr(&syn::Expr::If(expr_if.clone()))?)),
@@ -973,14 +1085,17 @@ fn convert_generics(generics: &syn::Generics) -> Vec<GenericParam> {
         .params
         .iter()
         .filter_map(|param| match param {
-            syn::GenericParam::Type(type_param) => Some(GenericParam {
+            syn::GenericParam::Type(type_param) => Some(GenericParam::Type(TypeParameter {
                 name: type_param.ident.to_string(),
                 bounds: type_param
                     .bounds
                     .iter()
                     .map(|bound| normalize_tokens(bound.to_token_stream()))
                     .collect(),
-            }),
+            })),
+            syn::GenericParam::Lifetime(param) => {
+                Some(GenericParam::Lifetime(convert_lifetime_param(param)))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -998,7 +1113,9 @@ fn convert_generics(generics: &syn::Generics) -> Vec<GenericParam> {
             }
 
             let name = type_path.path.segments[0].ident.to_string();
-            if let Some(param) = params.iter_mut().find(|param| param.name == name) {
+            if let Some(param) = params.iter_mut().filter_map(GenericParam::type_parameter_mut)
+                .find(|param| param.name == name)
+            {
                 for bound in &predicate.bounds {
                     let bound = normalize_tokens(bound.to_token_stream());
                     if !param.bounds.iter().any(|existing| existing == &bound) {
@@ -1010,6 +1127,13 @@ fn convert_generics(generics: &syn::Generics) -> Vec<GenericParam> {
     }
 
     params
+}
+
+fn convert_lifetime_param(param: &syn::LifetimeParam) -> LifetimeParameter {
+    LifetimeParameter {
+        name: param.lifetime.to_string(),
+        bounds: param.bounds.iter().map(ToString::to_string).collect(),
+    }
 }
 
 /// Convert a declaration visibility.
@@ -1134,16 +1258,6 @@ fn extract_derives(attrs: &[syn::Attribute]) -> Vec<String> {
             _ => Vec::new(),
         })
         .collect()
-}
-
-fn convert_pat_name(pat: &Pat) -> syn::Result<String> {
-    match pat {
-        Pat::Ident(pat_ident) => Ok(pat_ident.ident.to_string()),
-        other => Err(syn::Error::new_spanned(
-            other,
-            "unsupported parameter pattern in RustLightAST parser",
-        )),
-    }
 }
 
 fn normalize_tokens(tokens: TokenStream) -> String {

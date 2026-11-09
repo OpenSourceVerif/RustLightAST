@@ -19,7 +19,7 @@ fn downstream_consumer_can_parse_and_print_without_an_optimizer() {
 
 #[test]
 fn unsupported_body_still_allows_marked_type_fact_recovery() {
-    let source = "pub fn bytes() -> [u8; 4] { [0u8; 4] }";
+    let source = "pub fn bytes() -> [u8; 4] { const { [0u8; 4] } }";
     let _: ParseError = parse_rust_source(source, "example").unwrap_err();
     let facts = parse_rust_type_facts(source, "example").unwrap();
     let Item::Function(function) = &facts.items[0] else {
@@ -43,17 +43,49 @@ fn optimizer_type_argument_helper_remains_available() {
 }
 
 #[test]
-fn parser_keeps_its_existing_control_flow_boundary() {
+fn parser_rejects_labels_in_control_flow() {
     for source in [
-        "fn f() { while false {} }",
-        "fn f() { for x in [true] {} }",
-        "fn f() { return; }",
+        "fn f() { 'outer: loop { break 'outer; } }",
+        "fn f() { 'outer: while false {} }",
+        "fn f() { 'outer: for _ in [true] {} }",
+        "fn f() { 'outer: { break 'outer; } }",
+        "fn f() { loop { continue 'outer; } }",
+        "fn f() { loop { break 'outer; } }",
     ] {
-        assert!(
-            parse_rust_source(source, "unsupported").is_err(),
-            "{source}"
-        );
+        assert!(parse_rust_source(source, "unsupported")
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported expression label"), "{source}");
     }
+}
+
+#[test]
+fn loop_patterns_and_jump_values_roundtrip() {
+    let source = r#"
+fn evaluate(mut items: Vec<(u8, u8)>, stop: bool) -> u8 {
+    let mut sum = 0;
+    for (a, b) in [(1, 2), (3, 4)] {
+        sum = sum + a + b;
+    }
+    while let Some((x, y)) = items.pop() {
+        sum = sum + x + y;
+    }
+    loop {
+        if stop { return sum }
+        if sum == 10 { break sum + 1; }
+        sum = sum - 1;
+        continue;
+    }
+}
+"#;
+    let module = parse_rust_source(source, "loops").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    assert!(printed.contains("for (a, b) in"));
+    assert!(printed.contains("while let Some((x, y)) = items.pop()"));
+    assert!(printed.contains("return sum"));
+    assert!(printed.contains("break sum + 1"));
+    assert!(printed.contains("continue;"));
+    parse_rust_source(&printed, "roundtrip").unwrap();
 }
 
 #[test]
@@ -101,5 +133,32 @@ fn factory() -> impl ::core::clone::Clone + std::ops::Fn(u32) -> u32 + 'static {
     assert!(printed.contains("Box<dyn std::ops::Fn() -> u32 + '_>"));
     assert!(printed.contains("&(dyn std::ops::Fn() -> u32 + '_)"));
     assert!(printed.contains("impl ::core::clone::Clone + std::ops::Fn(u32) -> u32 + 'static"));
+    parse_rust_source(&printed, "roundtrip").unwrap();
+}
+
+#[test]
+fn declared_lifetimes_remain_attached_to_their_binders_and_references() {
+    let source = r#"
+pub fn relay<'short, 'long: 'short, T: Clone>(value: &'long mut T) -> &'short T { value }
+pub fn callback() -> impl for<'a> Fn(&'a u32) -> &'a u32 + Clone { |value| value }
+"#;
+    let module = parse_rust_source(source, "lifetimes").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    assert!(printed.contains("relay<'short, 'long: 'short, T>"));
+    assert!(printed.contains("(value: &'long mut T) -> &'short T"));
+    assert!(printed.contains("for<'a> Fn(&'a u32) -> &'a u32 + Clone"));
+    parse_rust_source(&printed, "roundtrip").unwrap();
+}
+
+#[test]
+fn parameter_reassignment_retains_the_mutable_binding() {
+    let source = "pub fn advance(mut value: u32) -> u32 { value = value + 1; value }";
+    let module = parse_rust_source(source, "parameter_binding").unwrap();
+    let Item::Function(function) = &module.items[0] else {
+        panic!("expected function");
+    };
+    assert_eq!(function.params[0].name, "value");
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    assert!(printed.contains("advance(mut value: u32)"));
     parse_rust_source(&printed, "roundtrip").unwrap();
 }

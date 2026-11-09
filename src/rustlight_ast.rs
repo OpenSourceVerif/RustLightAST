@@ -115,7 +115,8 @@ pub enum Type {
     Named(String),                    // i32, String
     Generic(String, Vec<Type>),       // HashMap<K, V>
     CallableTrait(CallableTraitType), // dyn Fn(A) -> B / impl Fn(A) -> B
-    Reference(Box<Type>, bool, bool), // &mut T, first bool indicates reference, second bool indicates mutability
+    /// Reference target, optional explicit lifetime, and mutability.
+    Reference(Box<Type>, Option<String>, bool),
     Tuple(Vec<Type>),                 // (T1, T2)
     Slice(Box<Type>),                 // [T]
     Array(Box<Type>, usize),          // [T; N] fixed-size array
@@ -135,6 +136,7 @@ pub struct CallableTraitType {
     pub return_type: Box<Type>,
     pub leading_bounds: Vec<CallableBound>,
     pub trailing_bounds: Vec<CallableBound>,
+    pub higher_ranked: Vec<LifetimeParameter>,
 }
 
 /// A bound on the callable in addition to its call signature.
@@ -211,6 +213,14 @@ pub enum Expr {
     },
     Literal(Literal),
     Array(Vec<Expr>),
+    Repeat {
+        value: Box<Expr>,
+        len: Box<Expr>,
+    },
+    Range {
+        start: Option<Box<Expr>>,
+        end: RangeEnd,
+    },
     Tuple(Vec<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     MethodCall(Box<Expr>, String, Vec<Expr>),
@@ -221,11 +231,19 @@ pub enum Expr {
         body: Block,
     },
     For {
-        pattern: String,
+        pattern: Pattern,
         iter: Box<Expr>,
         body: Block,
     },
+    Let {
+        pattern: Pattern,
+        value: Box<Expr>,
+    },
+    Return(Option<Box<Expr>>),
+    Break(Option<Box<Expr>>),
+    Continue,
     Await(Box<Expr>),
+    Try(Box<Expr>),
     /// `(params, body, is_move)` — third field is `true` for `move |…| …` closures.
     Closure(Vec<ClosureParam>, Box<Expr>, bool),
     /// A closure whose explicit Rust return type must survive parse/print.
@@ -254,6 +272,38 @@ pub enum Expr {
     Parenthesized(Box<Expr>),         // (expr), e.g., (a + b)
     Cast(Box<Expr>, Type),            // expr as Type
     Assign(Box<Expr>, Box<Expr>), // left = right, e.g., state = State::S0 // lazy_static! macro support
+}
+
+/// A half-open range can omit its end. An inclusive range requires one.
+#[derive(Debug, Clone)]
+pub enum RangeEnd {
+    Exclusive(Option<Box<Expr>>),
+    Inclusive(Box<Expr>),
+}
+
+impl RangeEnd {
+    pub fn expression(&self) -> Option<&Expr> {
+        match self {
+            Self::Exclusive(end) => end.as_deref(),
+            Self::Inclusive(end) => Some(end),
+        }
+    }
+
+    pub fn expression_mut(&mut self) -> Option<&mut Expr> {
+        match self {
+            Self::Exclusive(end) => end.as_deref_mut(),
+            Self::Inclusive(end) => Some(end),
+        }
+    }
+
+    pub fn map_expression(&self, rewrite: impl FnOnce(&Expr) -> Expr) -> Self {
+        match self {
+            Self::Exclusive(end) => {
+                Self::Exclusive(end.as_deref().map(|end| Box::new(rewrite(end))))
+            }
+            Self::Inclusive(end) => Self::Inclusive(Box::new(rewrite(end))),
+        }
+    }
 }
 
 /// A named field or the position of a tuple field.
@@ -317,9 +367,6 @@ pub enum Statement {
     Let(LetStmt),
     Expr(Expr),
     Item(Box<Item>),
-    Return(Option<Expr>), // return; / return expr;
-    Continue,        // continue statement
-    Break,           // break statement
     Comment(String), // comment statement
 }
 
@@ -372,15 +419,60 @@ pub struct Variant {
 }
 
 #[derive(Debug, Clone)]
-pub struct GenericParam {
+pub enum GenericParam {
+    Type(TypeParameter),
+    Lifetime(LifetimeParameter),
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeParameter {
     pub name: String,
-    pub bounds: Vec<String>, // trait bounds
+    pub bounds: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifetimeParameter {
+    /// Spelling including the apostrophe.
+    pub name: String,
+    pub bounds: Vec<String>,
+}
+
+impl GenericParam {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Type(param) => &param.name,
+            Self::Lifetime(param) => &param.name,
+        }
+    }
+
+    pub fn bounds(&self) -> &[String] {
+        match self {
+            Self::Type(param) => &param.bounds,
+            Self::Lifetime(param) => &param.bounds,
+        }
+    }
+
+    pub fn type_parameter(&self) -> Option<&TypeParameter> {
+        match self {
+            Self::Type(param) => Some(param),
+            Self::Lifetime(_) => None,
+        }
+    }
+
+    pub fn type_parameter_mut(&mut self) -> Option<&mut TypeParameter> {
+        match self {
+            Self::Type(param) => Some(param),
+            Self::Lifetime(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
     pub ty: Type,
+    /// Mutability of the binding, independently of a reference type's mutability.
+    pub mutable: bool,
 }
 
 #[derive(Debug, Clone)]
