@@ -1,5 +1,9 @@
 // crates/rustlightast/src/rustlight_ast.rs
 
+mod pattern;
+
+pub use pattern::{BindingMode, Pattern, PatternField};
+
 /// Lightweight Rust abstract syntax tree (module level)
 #[derive(Debug, Clone)]
 pub struct RustModule {
@@ -117,6 +121,7 @@ pub enum Type {
     Array(Box<Type>, usize),          // [T; N] fixed-size array
     Unit,                             // ()
     Never,                            // !
+    Infer,                            // _
 }
 
 /// Callable trait type such as `dyn Fn(A) -> B` or `impl Fn(A) -> B`.
@@ -175,7 +180,6 @@ impl From<String> for ClosureParam {
 #[derive(Debug, Clone)]
 pub enum PathType {
     Namespace, // separated by :: (e.g., std::thread)
-    Member,    // separated by . (e.g., self.field)
 }
 
 /// Expression
@@ -185,6 +189,15 @@ pub enum Expr {
     /// An opaque macro invocation preserved as Rust source, e.g. `panic!("msg")`.
     Macro(String),
     Path(Vec<String>, PathType),
+    Field {
+        base: Box<Expr>,
+        member: Member,
+    },
+    Record {
+        path: Vec<String>,
+        fields: Vec<RecordField>,
+        rest: Option<Box<Expr>>,
+    },
     Literal(Literal),
     Array(Vec<Expr>),
     Tuple(Vec<Expr>),
@@ -232,10 +245,26 @@ pub enum Expr {
     Assign(Box<Expr>, Box<Expr>), // left = right, e.g., state = State::S0 // lazy_static! macro support
 }
 
+/// A named field or the position of a tuple field.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Member {
+    Named(String),
+    Index(u32),
+}
+
+/// The value of a field initializer, in source evaluation order.
+#[derive(Debug, Clone)]
+pub struct RecordField {
+    pub member: Member,
+    pub value: Expr,
+    /// Preserve `field` when the value is still the same-named binding.
+    pub shorthand: bool,
+}
+
 // Match expression arm
 #[derive(Debug, Clone)]
 pub struct MatchArm {
-    pub pattern: String,
+    pub pattern: Pattern,
     pub guard: Option<Expr>,
     pub body: Block,
 }

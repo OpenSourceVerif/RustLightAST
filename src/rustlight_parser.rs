@@ -5,6 +5,10 @@
 /// Parse and conversion errors returned by the public entry points.
 pub use syn::Error as ParseError;
 
+mod pattern;
+
+pub use pattern::parse_rust_pattern;
+
 use proc_macro2::TokenStream;
 use syn::{
     parse_file, AngleBracketedGenericArguments, ExprArray, ExprAssign, ExprBinary, ExprBlock,
@@ -21,8 +25,8 @@ use crate::RustCodeGenerator;
 use crate::{
     Attribute, AttributeArg, Block, CallableTraitQualifier, CallableTraitType, ClosureParam,
     ConstDef, EnumDef, Expr, Field, FunctionDef, GenericParam, ImplBlock, ImplItem, Item, LetStmt,
-    Literal, MatchArm, Param, PathType, RustModule, Statement, StructDef, Type, TypeAlias,
-    UnionDef, UseKind, UseStatement, Variant, Visibility,
+    Literal, MatchArm, Member, Param, PathType, RecordField, RustModule, Statement, StructDef, Type,
+    TypeAlias, UnionDef, UseKind, UseStatement, Variant, Visibility,
 };
 
 /// Marker attached to recovered function signatures with synthetic empty bodies.
@@ -432,6 +436,7 @@ fn convert_type(ty: &SynType) -> syn::Result<Type> {
             convert_callable_trait_bounds(bounds.iter(), CallableTraitQualifier::Impl)
         }
         SynType::Never(_) => Ok(Type::Never),
+        SynType::Infer(_) => Ok(Type::Infer),
         SynType::Paren(TypeParen { elem, .. }) | SynType::Group(TypeGroup { elem, .. }) => {
             convert_type(elem)
         }
@@ -698,10 +703,31 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
             Box::new(convert_expr(expr)?),
             Box::new(convert_expr(index)?),
         )),
-        syn::Expr::Field(ExprField { base, member, .. }) => {
-            let mut path = flatten_member_path(base)?;
-            path.push(member.to_token_stream().to_string());
-            Ok(Expr::Path(path, PathType::Member))
+        syn::Expr::Field(ExprField { base, member, .. }) => Ok(Expr::Field {
+            base: Box::new(convert_expr(base)?),
+            member: convert_member(member),
+        }),
+        syn::Expr::Struct(record) => {
+            if record.qself.is_some() {
+                return Err(syn::Error::new_spanned(
+                    record,
+                    "unsupported qualified record constructor",
+                ));
+            }
+            Ok(Expr::Record {
+                path: path_segments(&record.path),
+                fields: record
+                    .fields
+                    .iter()
+                    .map(convert_record_field)
+                    .collect::<syn::Result<_>>()?,
+                rest: record
+                    .rest
+                    .as_deref()
+                    .map(convert_expr)
+                    .transpose()?
+                    .map(Box::new),
+            })
         }
         syn::Expr::Array(ExprArray { elems, .. }) => Ok(Expr::Array(
             elems
@@ -770,7 +796,7 @@ fn expr_to_block(expr: &syn::Expr) -> syn::Result<Block> {
 
 fn convert_match_arm(arm: &syn::Arm) -> syn::Result<MatchArm> {
     Ok(MatchArm {
-        pattern: normalize_tokens(arm.pat.to_token_stream()),
+        pattern: pattern::convert_pattern(&arm.pat)?,
         guard: arm
             .guard
             .as_ref()
@@ -787,35 +813,42 @@ fn convert_expr_path(expr_path: &ExprPath) -> syn::Result<Expr> {
         )));
     }
 
-    let segments = expr_path
-        .path
-        .segments
-        .iter()
-        .map(path_segment_source)
-        .collect::<Vec<_>>();
+    let segments = path_segments(&expr_path.path);
 
-    if segments.len() == 1 {
-        Ok(Expr::Ident(segments[0].clone()))
-    } else {
-        Ok(Expr::Path(segments, PathType::Namespace))
+    match segments.as_slice() {
+        [segment] => Ok(Expr::Ident(segment.clone())),
+        _ => Ok(Expr::Path(segments, PathType::Namespace)),
     }
 }
 
-fn flatten_member_path(expr: &syn::Expr) -> syn::Result<Vec<String>> {
-    match expr {
-        syn::Expr::Path(ExprPath { path, .. }) => {
-            Ok(path.segments.iter().map(path_segment_source).collect())
-        }
-        syn::Expr::Field(ExprField { base, member, .. }) => {
-            let mut segments = flatten_member_path(base)?;
-            segments.push(member.to_token_stream().to_string());
-            Ok(segments)
-        }
-        _ => Err(syn::Error::new_spanned(
-            expr,
-            "unsupported member expression base",
-        )),
+fn convert_member(member: &syn::Member) -> Member {
+    match member {
+        syn::Member::Named(name) => Member::Named(name.to_string()),
+        syn::Member::Unnamed(index) => Member::Index(index.index),
     }
+}
+
+fn convert_record_field(field: &syn::FieldValue) -> syn::Result<RecordField> {
+    // DEFENSE: a `cfg` on an initializer controls whether its value is evaluated.
+    if !field.attrs.is_empty() {
+        return Err(syn::Error::new_spanned(
+            field,
+            "unsupported attribute on record field initializer",
+        ));
+    }
+    Ok(RecordField {
+        member: convert_member(&field.member),
+        value: convert_expr(&field.expr)?,
+        shorthand: field.colon_token.is_none(),
+    })
+}
+
+fn path_segments(path: &syn::Path) -> Vec<String> {
+    path.leading_colon
+        .iter()
+        .map(|_| String::new())
+        .chain(path.segments.iter().map(path_segment_source))
+        .collect()
 }
 
 fn path_segment_source(segment: &syn::PathSegment) -> String {
@@ -1051,7 +1084,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{parse_and_print_rust_source, parse_rust_source, parse_rust_type_facts};
-    use crate::{Expr, Item, RustCodeGenerator, Statement, Type};
+    use crate::{Expr, Item, Pattern, RustCodeGenerator, Statement, Type};
 
     #[test]
     fn parses_rec_get_sample_and_prints_it() {
@@ -1120,7 +1153,13 @@ pub fn get(x0: Option) -> Int {
                         Expr::Match { expr, arms } => {
                             assert!(matches!(expr.as_ref(), Expr::Ident(name) if name == "x0"));
                             assert_eq!(arms.len(), 3);
-                            assert_eq!(arms[2].pattern, "Option::Rec(p0)");
+                            assert!(matches!(
+                                &arms[2].pattern,
+                                Pattern::TupleStruct { path, fields }
+                                    if path == &["Option", "Rec"]
+                                        && matches!(fields.as_slice(),
+                                            [Pattern::Ident { name, .. }] if name == "p0")
+                            ));
                             assert_eq!(arms[2].body.stmts.len(), 1);
                             match &arms[2].body.stmts[0] {
                                 Statement::Let(let_stmt) => {

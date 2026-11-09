@@ -1,6 +1,8 @@
 #![allow(clippy::only_used_in_recursion)]
 use crate::rustlight_ast::*;
 
+mod pattern;
+
 const MAX_FUNCTION_SIGNATURE_WIDTH: usize = 80;
 
 // Rust code generator
@@ -417,18 +419,44 @@ impl RustCodeGenerator {
         match expr {
             Expr::Ident(id) => self.write(id),
             Expr::Macro(source) => self.write(source),
-            Expr::Path(path, path_type) => {
-                let separator = match path_type {
-                    PathType::Namespace => "::",
-                    PathType::Member => ".",
-                };
-
-                for (i, part) in path.iter().enumerate() {
-                    if i > 0 {
-                        self.write(separator);
-                    }
-                    self.write(part);
+            Expr::Path(path, PathType::Namespace) => self.generate_path(path),
+            Expr::Field { base, member } => {
+                let needs_parens = matches!(
+                    base.as_ref(),
+                    Expr::Assign(..) | Expr::BinaryOp(..) | Expr::Closure(..)
+                        | Expr::TypedClosure(..) | Expr::Reference(..) | Expr::UnaryOp(..)
+                );
+                if needs_parens {
+                    self.write("(");
                 }
+                self.generate_expr(base);
+                if needs_parens {
+                    self.write(")");
+                }
+                self.write(".");
+                self.generate_member(member);
+            }
+            Expr::Record { path, fields, rest } => {
+                self.generate_path(path);
+                self.write(" {");
+                for (index, field) in fields.iter().enumerate() {
+                    self.write(if index == 0 { " " } else { ", " });
+                    self.generate_member(&field.member);
+                    let shorthand = field.shorthand
+                        && matches!(
+                            (&field.member, &field.value),
+                            (Member::Named(name), Expr::Ident(value)) if name == value
+                        );
+                    if !shorthand {
+                        self.write(": ");
+                        self.generate_expr(&field.value);
+                    }
+                }
+                if let Some(rest) = rest {
+                    self.write(if fields.is_empty() { " .." } else { ", .." });
+                    self.generate_expr(rest);
+                }
+                self.write(if fields.is_empty() && rest.is_none() { "}" } else { " }" });
             }
             Expr::Literal(lit) => self.generate_literal(lit),
             Expr::Array(items) => {
@@ -591,21 +619,13 @@ impl RustCodeGenerator {
                 self.writeln(" {");
                 self.indent();
                 for arm in arms {
-                    self.write(&arm.pattern);
+                    self.generate_pattern(&arm.pattern);
                     if let Some(guard) = &arm.guard {
                         self.write(" if ");
                         self.generate_expr(guard);
                     }
                     self.writeln(" => {");
                     self.indent();
-                    // Add comments based on the arm pattern
-                    if arm.pattern.starts_with("Ok(") {
-                        self.writeln("// Message received → call handler function");
-                    } else if arm.pattern.contains("TryRecvError::Empty") {
-                        self.writeln("// No message; do not block, skip directly");
-                    } else if arm.pattern.contains("TryRecvError::Disconnected") {
-                        self.writeln("// Channel has been closed");
-                    }
                     // Generate arm body, but do not add a semicolon to the final expression
                     self.generate_match_arm_body(&arm.body);
                     self.dedent();
@@ -742,6 +762,22 @@ impl RustCodeGenerator {
             Expr::Cast(expr, ty) => {
                 self.generate_cast_expr(expr, ty, true);
             }
+        }
+    }
+
+    fn generate_path(&mut self, path: &[String]) {
+        for (index, segment) in path.iter().enumerate() {
+            if index != 0 {
+                self.write("::");
+            }
+            self.write(segment);
+        }
+    }
+
+    fn generate_member(&mut self, member: &Member) {
+        match member {
+            Member::Named(name) => self.write(name),
+            Member::Index(index) => self.write(&index.to_string()),
         }
     }
 
@@ -1006,6 +1042,7 @@ impl RustCodeGenerator {
             Type::Array(inner, size) => format!("[{}; {}]", self.type_to_string(inner), size),
             Type::Unit => "()".to_string(),
             Type::Never => "!".to_string(),
+            Type::Infer => "_".to_string(),
         }
     }
 

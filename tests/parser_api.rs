@@ -1,7 +1,7 @@
 use rustlightast::{
     parse_rust_source, parse_rust_type_facts,
     rustlight_parser::{first_explicit_type_argument, TYPE_FACT_ONLY_DOC},
-    Expr, Item, ParseError, RustCodeGenerator, Type,
+    Expr, Item, Member, ParseError, RustCodeGenerator, Type,
 };
 
 #[test]
@@ -54,4 +54,33 @@ fn parser_keeps_its_existing_control_flow_boundary() {
             "{source}"
         );
     }
+}
+
+#[test]
+fn record_fields_can_be_rewritten_without_losing_shorthand_or_update_order() {
+    let source = r#"
+fn row(original: Row, tag: u8, second: u8) -> Row {
+    crate::Row { tag, first: get(1)[0].0, second, ..original }
+}
+"#;
+    let mut module = parse_rust_source(source, "record").unwrap();
+    let Item::Function(function) = &mut module.items[0] else {
+        panic!("expected function");
+    };
+    let Some(Expr::Record { fields, .. }) = function.body.expr.as_deref_mut() else {
+        panic!("expected record initializer");
+    };
+    fields[0].value = Expr::Ident("new_tag".into());
+    let Expr::Field {
+        base,
+        member: Member::Index(0),
+    } = &fields[1].value
+    else {
+        panic!("expected tuple-field access");
+    };
+    assert!(matches!(base.as_ref(), Expr::Index(..)));
+
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    assert!(printed.contains("crate::Row { tag: new_tag, first: get(1)[0].0, second, ..original }"));
+    parse_rust_source(&printed, "roundtrip").unwrap();
 }
