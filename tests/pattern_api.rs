@@ -28,6 +28,7 @@ fn nested_alternation_and_type_ascription_survive_the_pattern_boundary() {
     for source in [
         "&mut crate::Node::Leaf(whole @ (1 | 2), _, ..)",
         "(left, _): (u8, u8)",
+        "value: ::std::rc::Rc<::std::string::String>",
     ] {
         let pattern = parse_rust_pattern(source).unwrap();
         assert_eq!(printer.generate_pattern_code(&pattern), source);

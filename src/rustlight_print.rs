@@ -147,6 +147,7 @@ impl RustCodeGenerator {
                 if i > 0 {
                     self.write(", ");
                 }
+                self.write(&self.visibility(&field.vis));
                 self.write(&self.type_to_string(&field.ty));
             }
             self.writeln(");");
@@ -168,17 +169,18 @@ impl RustCodeGenerator {
     }
 
     fn generate_field(&mut self, field: &Field) {
-        for attr in &field.attrs {
-            self.generate_attribute(attr);
-        }
-        self.write(&format!(
-            "pub {}: {},",
-            field.name,
-            self.type_to_string(&field.ty)
-        ));
         for doc in &field.docs {
             self.writeln(doc);
         }
+        for attr in &field.attrs {
+            self.generate_attribute(attr);
+        }
+        self.writeln(&format!(
+            "{}{}: {},",
+            self.visibility(&field.vis),
+            field.name,
+            self.type_to_string(&field.ty)
+        ));
     }
 
     fn generate_impl(&mut self, i: &ImplBlock) {
@@ -1008,21 +1010,34 @@ impl RustCodeGenerator {
                     .map(|arg| self.type_to_string(arg))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!(
-                    "{} {}({}) -> {}",
-                    qualifier,
-                    callable.trait_name,
-                    args,
+                let mut source = format!("{qualifier} ");
+                for bound in &callable.leading_bounds {
+                    source.push_str(&callable_bound_to_string(bound));
+                    source.push_str(" + ");
+                }
+                source.push_str(&format!(
+                    "{}({args}) -> {}",
+                    callable.trait_path.join("::"),
                     self.type_to_string(&callable.return_type)
-                )
+                ));
+                for bound in &callable.trailing_bounds {
+                    source.push_str(" + ");
+                    source.push_str(&callable_bound_to_string(bound));
+                }
+                source
             }
             Type::Reference(inner, is_reference, mutable) => {
-                format!(
-                    "{}{}{}",
-                    if *is_reference { "&" } else { "" },
-                    if *mutable { "mut " } else { "" },
-                    self.type_to_string(inner)
-                )
+                let reference = if *is_reference { "&" } else { "" };
+                let mutable = if *mutable { "mut " } else { "" };
+                let source = self.type_to_string(inner);
+                if *is_reference
+                    && matches!(inner.as_ref(), Type::CallableTrait(callable)
+                        if !callable.leading_bounds.is_empty() || !callable.trailing_bounds.is_empty())
+                {
+                    format!("{reference}{mutable}({source})")
+                } else {
+                    format!("{reference}{mutable}{source}")
+                }
             }
             Type::Tuple(types) => {
                 let mut s = "(".to_string();
@@ -1050,7 +1065,12 @@ impl RustCodeGenerator {
         match vis {
             Visibility::Public => "pub ".to_string(),
             Visibility::Private => "".to_string(),
-            Visibility::Restricted(path) => format!("pub(in {}) ", path.join("::")),
+            Visibility::Restricted(path) => match path.as_slice() {
+                [scope] if matches!(scope.as_str(), "crate" | "self" | "super") => {
+                    format!("pub({scope}) ")
+                }
+                _ => format!("pub(in {}) ", path.join("::")),
+            },
             Visibility::None => "".to_string(),
         }
     }
@@ -1168,6 +1188,13 @@ fn use_root(use_stmt: &UseStatement) -> Option<&str> {
     use_stmt.path.first().map(String::as_str)
 }
 
+fn callable_bound_to_string(bound: &CallableBound) -> String {
+    match bound {
+        CallableBound::Lifetime(lifetime) => lifetime.clone(),
+        CallableBound::Trait(path) => path.join("::"),
+    }
+}
+
 fn ordered_bounds_to_string(bounds: &[String]) -> String {
     bounds
         .iter()
@@ -1192,9 +1219,11 @@ mod tests {
             "Rc".to_string(),
             vec![Type::CallableTrait(CallableTraitType {
                 qualifier: CallableTraitQualifier::Dyn,
-                trait_name: "Fn".to_string(),
+                trait_path: vec!["Fn".to_string()],
                 args: vec![Type::Named("Int".to_string())],
                 return_type: Box::new(Type::Named("Int".to_string())),
+                leading_bounds: Vec::new(),
+                trailing_bounds: Vec::new(),
             })],
         )
     }

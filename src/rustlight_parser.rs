@@ -9,7 +9,7 @@ mod pattern;
 
 pub use pattern::parse_rust_pattern;
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 use syn::{
     parse_file, AngleBracketedGenericArguments, ExprArray, ExprAssign, ExprBinary, ExprBlock,
     ExprCall, ExprCast, ExprClosure, ExprField, ExprGroup, ExprIf, ExprIndex, ExprLit, ExprMatch,
@@ -23,7 +23,7 @@ use syn::{
 #[cfg(test)]
 use crate::RustCodeGenerator;
 use crate::{
-    Attribute, AttributeArg, Block, CallableTraitQualifier, CallableTraitType, ClosureParam,
+    Attribute, AttributeArg, Block, CallableBound, CallableTraitQualifier, CallableTraitType, ClosureParam,
     ConstDef, EnumDef, Expr, Field, FunctionDef, GenericParam, ImplBlock, ImplItem, Item, LetStmt,
     Literal, MatchArm, Member, Param, PathType, RecordField, RustModule, Statement, StructDef, Type,
     TypeAlias, UnionDef, UseKind, UseStatement, Variant, Visibility,
@@ -40,7 +40,7 @@ pub const TYPE_FACT_ONLY_DOC: &str = "@isabelle2rust-type-fact-only";
 /// not a lossless parser for arbitrary Rust source.
 pub fn parse_rust_source(source: &str, module_name: impl Into<String>) -> syn::Result<RustModule> {
     let file = parse_file(source)?;
-    convert_file(file, module_name.into())
+    convert_file(&file, module_name.into())
 }
 
 /// Recover package-wide type facts even when an unsupported function body
@@ -94,7 +94,8 @@ fn convert_type_fact_item(item: &SynItem) -> Option<Item> {
     }
 }
 
-fn convert_function_type_fact(item_fn: &syn::ItemFn) -> Option<FunctionDef> {
+/// Lower a declaration signature for analyses that do not inspect its body.
+pub fn convert_function_type_fact(item_fn: &syn::ItemFn) -> Option<FunctionDef> {
     Some(FunctionDef {
         name: item_fn.sig.ident.to_string(),
         params: item_fn
@@ -128,7 +129,8 @@ pub fn parse_and_print_rust_source(
     Ok((module, printed))
 }
 
-fn convert_file(file: File, module_name: String) -> syn::Result<RustModule> {
+/// Lower a parsed file at the Rust source boundary.
+pub fn convert_file(file: &File, module_name: String) -> syn::Result<RustModule> {
     let mut items = file
         .attrs
         .iter()
@@ -151,7 +153,8 @@ fn convert_file(file: File, module_name: String) -> syn::Result<RustModule> {
     })
 }
 
-fn convert_item(item: &SynItem) -> syn::Result<Item> {
+/// Lower a parsed item without reparsing its source text.
+pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
     match item {
         SynItem::Enum(item_enum) => Ok(Item::Enum(EnumDef {
             name: item_enum.ident.to_string(),
@@ -221,20 +224,15 @@ fn convert_item(item: &SynItem) -> syn::Result<Item> {
             docs: extract_docs(&item_const.attrs),
         })),
         SynItem::Use(item_use) => Ok(Item::Use(convert_use_tree(&item_use.tree))),
-        SynItem::Impl(item_impl) => Ok(Item::Impl(ImplBlock {
-            target: convert_type(&item_impl.self_ty)?,
-            generics: convert_generics(&item_impl.generics),
-            items: item_impl
+        SynItem::Impl(item_impl) => {
+            let mut block = convert_impl_header(item_impl)?;
+            block.items = item_impl
                 .items
                 .iter()
                 .map(convert_impl_item)
-                .collect::<syn::Result<Vec<_>>>()?,
-            trait_impl: item_impl
-                .trait_
-                .as_ref()
-                .map(|(_, path, _)| convert_type_path(path))
-                .transpose()?,
-        })),
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(Item::Impl(block))
+        }
         SynItem::Mod(item_mod) if item_mod.content.is_none() => Ok(Item::Raw(format!(
             "{}mod {};",
             visibility_to_source(&convert_visibility(&item_mod.vis)),
@@ -299,6 +297,7 @@ fn convert_field(field: &syn::Field) -> syn::Result<Field> {
             .map(|ident| ident.to_string())
             .unwrap_or_default(),
         ty: convert_type(&field.ty)?,
+        vis: convert_visibility(&field.vis),
         docs: extract_docs(&field.attrs),
         attrs: convert_attributes(&field.attrs),
     })
@@ -307,22 +306,28 @@ fn convert_field(field: &syn::Field) -> syn::Result<Field> {
 fn convert_fn_arg(arg: &syn::FnArg) -> syn::Result<Param> {
     match arg {
         syn::FnArg::Receiver(receiver) => Ok(Param {
-            name: if receiver.reference.is_some() {
-                if receiver.mutability.is_some() {
-                    "&mut self".to_string()
-                } else {
-                    "&self".to_string()
-                }
-            } else {
-                "self".to_string()
-            },
-            ty: Type::Named("Self".to_string()),
+            name: "self".to_string(),
+            ty: convert_type(&receiver.ty)?,
         }),
         syn::FnArg::Typed(pat_type) => Ok(Param {
             name: convert_pat_name(&pat_type.pat)?,
             ty: convert_type(&pat_type.ty)?,
         }),
     }
+}
+
+/// Convert the type and generic parameters of an impl without its items.
+pub fn convert_impl_header(item: &syn::ItemImpl) -> syn::Result<ImplBlock> {
+    Ok(ImplBlock {
+        target: convert_type(&item.self_ty)?,
+        generics: convert_generics(&item.generics),
+        items: Vec::new(),
+        trait_impl: item
+            .trait_
+            .as_ref()
+            .map(|(_, path, _)| convert_type_path(path))
+            .transpose()?,
+    })
 }
 
 fn convert_impl_item(item: &SynImplItem) -> syn::Result<ImplItem> {
@@ -404,7 +409,16 @@ fn convert_return_type(output: &ReturnType) -> syn::Result<Type> {
 
 fn convert_type(ty: &SynType) -> syn::Result<Type> {
     match ty {
-        SynType::Path(type_path) => convert_type_path(&type_path.path),
+        SynType::Path(type_path) => {
+            // DEFENSE: dropping qself changes which associated type is named.
+            if type_path.qself.is_some() {
+                return Err(syn::Error::new_spanned(
+                    type_path,
+                    "qualified associated type is unsupported",
+                ));
+            }
+            convert_type_path(&type_path.path)
+        }
         SynType::Reference(TypeReference {
             elem, mutability, ..
         }) => Ok(Type::Reference(
@@ -451,33 +465,71 @@ fn convert_callable_trait_bounds<'a>(
     bounds: impl Iterator<Item = &'a TypeParamBound>,
     qualifier: CallableTraitQualifier,
 ) -> syn::Result<Type> {
-    let callable_bounds = bounds
-        .filter_map(|bound| match bound {
-            TypeParamBound::Trait(trait_bound) => Some(trait_bound),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut signature = None;
+    let mut clone = false;
+    let mut leading_bounds = Vec::new();
+    let mut trailing_bounds = Vec::new();
 
-    if callable_bounds.len() != 1 {
+    for bound in bounds {
+        let additional = match bound {
+            TypeParamBound::Lifetime(lifetime) => CallableBound::Lifetime(lifetime.to_string()),
+            TypeParamBound::Trait(trait_bound)
+                if matches!(trait_bound.modifier, syn::TraitBoundModifier::None) =>
+            {
+                let path = &trait_bound.path;
+                let Some(last) = path.segments.last() else {
+                    return Err(syn::Error::new_spanned(path, "empty callable trait path"));
+                };
+                if matches!(last.arguments, PathArguments::Parenthesized(_)) {
+                    if signature.replace(trait_bound).is_some() {
+                        return Err(syn::Error::new_spanned(bound, "multiple callable trait bounds"));
+                    }
+                    continue;
+                }
+                if !matches!(qualifier, CallableTraitQualifier::Impl)
+                    || clone
+                    || trait_bound.lifetimes.is_some()
+                    || !last.arguments.is_none()
+                    || !is_native_callable_bound_path(path, "clone", "Clone")
+                {
+                    return Err(syn::Error::new_spanned(bound, "unsupported callable trait bound"));
+                }
+                clone = true;
+                CallableBound::Trait(callable_bound_path(path, path.segments.len()))
+            }
+            _ => return Err(syn::Error::new_spanned(bound, "unsupported callable trait bound")),
+        };
+        if signature.is_some() {
+            trailing_bounds.push(additional);
+        } else {
+            leading_bounds.push(additional);
+        }
+    }
+    let Some(signature) = signature else {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "unsupported callable trait bounds in RustLightAST parser",
+            "missing callable trait bound in RustLightAST parser",
+        ));
+    };
+    if clone && !is_native_callable_bound_path(&signature.path, "ops", "Fn") {
+        return Err(syn::Error::new_spanned(
+            signature,
+            "Clone is supported with the Fn call trait",
         ));
     }
-
-    convert_callable_trait_bound(callable_bounds[0], qualifier)
+    convert_callable_trait_bound(signature, qualifier, leading_bounds, trailing_bounds)
 }
 
 fn convert_callable_trait_bound(
     trait_bound: &TraitBound,
     qualifier: CallableTraitQualifier,
+    leading_bounds: Vec<CallableBound>,
+    trailing_bounds: Vec<CallableBound>,
 ) -> syn::Result<Type> {
     let last =
         trait_bound.path.segments.last().ok_or_else(|| {
             syn::Error::new_spanned(&trait_bound.path, "empty callable trait path")
         })?;
-    let trait_name = last.ident.to_string();
-
     let PathArguments::Parenthesized(ParenthesizedGenericArguments { inputs, output, .. }) =
         &last.arguments
     else {
@@ -486,19 +538,47 @@ fn convert_callable_trait_bound(
             "unsupported non-callable trait bound in RustLightAST parser",
         ));
     };
+    let mut trait_path =
+        callable_bound_path(&trait_bound.path, trait_bound.path.segments.len() - 1);
+    trait_path.push(last.ident.to_string());
 
     let args = inputs
         .iter()
         .map(convert_type)
         .collect::<syn::Result<Vec<_>>>()?;
     let return_type = Box::new(convert_return_type(output)?);
-
     Ok(Type::CallableTrait(CallableTraitType {
         qualifier,
-        trait_name,
+        trait_path,
         args,
         return_type,
+        leading_bounds,
+        trailing_bounds,
     }))
+}
+
+fn callable_bound_path(path: &syn::Path, segments: usize) -> Vec<String> {
+    path.leading_colon
+        .iter()
+        .map(|_| String::new())
+        .chain(path.segments.iter().take(segments).map(path_segment_source))
+        .collect()
+}
+
+fn is_native_callable_bound_path(path: &syn::Path, module: &str, name: &str) -> bool {
+    match path.segments.len() {
+        1 => path.leading_colon.is_none() && path.segments[0].ident == name,
+        3 => {
+            let root = &path.segments[0];
+            let parent = &path.segments[1];
+            (root.ident == "std" || root.ident == "core")
+                && root.arguments.is_none()
+                && parent.ident == module
+                && parent.arguments.is_none()
+                && path.segments[2].ident == name
+        }
+        _ => false,
+    }
 }
 
 fn convert_type_path(path: &syn::Path) -> syn::Result<Type> {
@@ -506,8 +586,6 @@ fn convert_type_path(path: &syn::Path) -> syn::Result<Type> {
         .segments
         .last()
         .ok_or_else(|| syn::Error::new_spanned(path, "empty path"))?;
-    let name = last.ident.to_string();
-
     let generic_args = match &last.arguments {
         PathArguments::None => Vec::new(),
         PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }) => args
@@ -525,33 +603,18 @@ fn convert_type_path(path: &syn::Path) -> syn::Result<Type> {
         }
     };
 
+    let segments: Vec<_> = path
+        .leading_colon
+        .iter()
+        .map(|_| String::new())
+        .chain(path.segments.iter().map(|segment| segment.ident.to_string()))
+        .collect();
     if !generic_args.is_empty() {
-        // Preserve path qualifiers so that e.g. `crate::Product_Type::Prod<A>`
-        // roundtrips as `crate::Product_Type::Prod<A>` rather than bare `Prod<A>`.
-        // Without this, source files that lack a `use crate::Product_Type::*;`
-        // import fail to compile after optimiser rewriting.
-        let qualified_name = if path.segments.len() > 1 {
-            let prefix = path
-                .segments
-                .iter()
-                .take(path.segments.len() - 1)
-                .map(|s| s.ident.to_string())
-                .collect::<Vec<_>>()
-                .join("::");
-            format!("{}::{}", prefix, name)
-        } else {
-            name
-        };
-        Ok(Type::Generic(qualified_name, generic_args))
-    } else if path.segments.len() > 1 {
-        Ok(Type::Path(
-            path.segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect(),
-        ))
+        Ok(Type::Generic(segments.join("::"), generic_args))
+    } else if segments.len() > 1 {
+        Ok(Type::Path(segments))
     } else {
-        Ok(Type::Named(name))
+        Ok(Type::Named(last.ident.to_string()))
     }
 }
 
@@ -572,12 +635,18 @@ fn convert_block(block: &syn::Block) -> syn::Result<Block> {
     let mut stmts = Vec::new();
     let mut tail_expr = None;
 
-    for stmt in &block.stmts {
+    for (index, stmt) in block.stmts.iter().enumerate() {
         match stmt {
             Stmt::Local(local) => stmts.push(Statement::Let(convert_local(local)?)),
-            Stmt::Item(item) => stmts.push(Statement::Item(Box::new(convert_item(item)?))),
+            Stmt::Item(item) => {
+                // Signature metadata is restored only for module/impl declarations.
+                // Keep local declarations opaque to retain lifetimes and opaque return capabilities.
+                stmts.push(Statement::Item(Box::new(Item::Raw(normalize_tokens(
+                    item.to_token_stream(),
+                )))));
+            }
             Stmt::Expr(expr, semi) => {
-                if semi.is_some() {
+                if semi.is_some() || index + 1 != block.stmts.len() {
                     stmts.push(Statement::Expr(convert_expr(expr)?));
                 } else {
                     tail_expr = Some(Box::new(convert_expr(expr)?));
@@ -589,7 +658,7 @@ fn convert_block(block: &syn::Block) -> syn::Result<Block> {
                 // the native Word adapter). Preserve it verbatim as an opaque
                 // item so the rest of the module, including explicit trait
                 // impls, remains available to package-wide analyses.
-                let source = normalize_tokens(mac.to_token_stream()).replace(" !", "!");
+                let source = normalize_tokens(mac.to_token_stream());
                 stmts.push(Statement::Item(Box::new(Item::Raw(source))));
             }
         }
@@ -602,16 +671,36 @@ fn convert_block(block: &syn::Block) -> syn::Result<Block> {
 }
 
 fn convert_local(local: &syn::Local) -> syn::Result<LetStmt> {
-    let (name, ifmut) = match &local.pat {
+    let (name, ifmut, ty) = match &local.pat {
+        Pat::Type(typed) => (
+            typed.pat.to_token_stream().to_string(),
+            false,
+            Some(convert_type(&typed.ty)?),
+        ),
         Pat::Ident(PatIdent {
-            ident, mutability, ..
-        }) => (ident.to_string(), mutability.is_some()),
-        pat => (pat.to_token_stream().to_string(), false),
+            ident,
+            mutability,
+            subpat,
+            ..
+        }) => {
+            if subpat.is_some() {
+                return Err(syn::Error::new_spanned(
+                    &local.pat,
+                    "unsupported at-pattern local binding in RustLightAST parser",
+                ));
+            }
+            (ident.to_string(), mutability.is_some(), None)
+        }
+        pat => (pat.to_token_stream().to_string(), false, None),
     };
 
-    let (ty, init) = match &local.init {
-        Some(LocalInit { expr, .. }) => (None, Some(convert_expr(expr)?)),
-        None => (None, None),
+    // DEFENSE: the else block of a let-else is part of its control flow.
+    if let Some(init) = local.init.as_ref().filter(|init| init.diverge.is_some()) {
+        return Err(syn::Error::new_spanned(init.expr.as_ref(), "unsupported let-else"));
+    }
+    let init = match &local.init {
+        Some(LocalInit { expr, .. }) => Some(convert_expr(expr)?),
+        None => None,
     };
 
     Ok(LetStmt {
@@ -738,7 +827,7 @@ fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         syn::Expr::Macro(expr_macro) => {
             // Preserve generated fallback arms such as
             // `_ => panic!("non-exhaustive match")` as opaque Rust source.
-            let source = normalize_tokens(expr_macro.to_token_stream()).replace(" !", "!");
+            let source = normalize_tokens(expr_macro.to_token_stream());
             Ok(Expr::Macro(source))
         }
         syn::Expr::Closure(ExprClosure {
@@ -923,7 +1012,8 @@ fn convert_generics(generics: &syn::Generics) -> Vec<GenericParam> {
     params
 }
 
-fn convert_visibility(vis: &SynVisibility) -> Visibility {
+/// Convert a declaration visibility.
+pub fn convert_visibility(vis: &SynVisibility) -> Visibility {
     match vis {
         SynVisibility::Public(_) => Visibility::Public,
         SynVisibility::Restricted(restricted) => Visibility::Restricted(
@@ -946,7 +1036,8 @@ fn visibility_to_source(vis: &Visibility) -> String {
     }
 }
 
-fn attribute_to_raw_source(attr: &syn::Attribute) -> String {
+/// Render an attribute in its original inner or outer position.
+pub fn attribute_to_raw_source(attr: &syn::Attribute) -> String {
     let marker = match attr.style {
         syn::AttrStyle::Inner(_) => "#!",
         syn::AttrStyle::Outer => "#",
@@ -967,7 +1058,8 @@ fn attribute_to_raw_source(attr: &syn::Attribute) -> String {
     }
 }
 
-fn convert_attributes(attrs: &[syn::Attribute]) -> Vec<Attribute> {
+/// Convert attributes represented by RustLightAST items.
+pub fn convert_attributes(attrs: &[syn::Attribute]) -> Vec<Attribute> {
     attrs.iter().filter_map(convert_attribute).collect()
 }
 
@@ -1003,7 +1095,8 @@ fn convert_literal_from_expr(expr: &syn::Expr) -> Option<Literal> {
     }
 }
 
-fn extract_docs(attrs: &[syn::Attribute]) -> Vec<String> {
+/// Recover documentation attributes for a RustLight declaration.
+pub fn extract_docs(attrs: &[syn::Attribute]) -> Vec<String> {
     attrs
         .iter()
         .filter_map(|attr| {
@@ -1013,10 +1106,11 @@ fn extract_docs(attrs: &[syn::Attribute]) -> Vec<String> {
             match &attr.meta {
                 Meta::NameValue(name_value) => {
                     if let syn::Expr::Lit(ExprLit {
-                        lit: Lit::Str(doc), ..
+                        lit: Lit::Str(_), ..
                     }) = &name_value.value
                     {
-                        Some(format!("///{}", doc.value()))
+                        // Keep doc text inside its literal instead of decoding it as Rust source.
+                        Some(attr.to_token_stream().to_string())
                     } else {
                         None
                     }
@@ -1053,19 +1147,73 @@ fn convert_pat_name(pat: &Pat) -> syn::Result<String> {
 }
 
 fn normalize_tokens(tokens: TokenStream) -> String {
-    tokens
-        .to_string()
-        .replace(" :: ", "::")
-        .replace(" (", "(")
-        .replace("( ", "(")
-        .replace(" )", ")")
-        .replace(" ,", ",")
+    render_tokens(tokens, false)
 }
 
 fn normalize_path_tokens(tokens: TokenStream) -> String {
-    normalize_tokens(tokens)
-        .replace("< ", "<")
-        .replace(" >", ">")
+    render_tokens(tokens, true)
+}
+
+fn render_tokens(tokens: TokenStream, path: bool) -> String {
+    fn append_text(parts: &mut Vec<(String, bool)>, text: &str) {
+        if let Some((previous, false)) = parts.last_mut() {
+            previous.push_str(text);
+        } else {
+            parts.push((text.to_string(), false));
+        }
+    }
+
+    fn append_stream(tokens: TokenStream, parts: &mut Vec<(String, bool)>) {
+        let mut first = true;
+        let mut joint = false;
+        for token in tokens {
+            if !first && !joint {
+                append_text(parts, " ");
+            }
+            first = false;
+            // Joint punctuation must remain joined, including :: and lifetimes.
+            joint = matches!(&token, TokenTree::Punct(punct) if punct.spacing() == Spacing::Joint);
+            match token {
+                TokenTree::Literal(literal) => parts.push((literal.to_string(), true)),
+                TokenTree::Group(group) => {
+                    let (open, close) = match group.delimiter() {
+                        Delimiter::Parenthesis => ("(", ")"),
+                        Delimiter::Brace => ("{ ", " }"),
+                        Delimiter::Bracket => ("[", "]"),
+                        Delimiter::None => ("", ""),
+                    };
+                    append_text(parts, open);
+                    append_stream(group.stream(), parts);
+                    append_text(parts, close);
+                }
+                token => append_text(parts, &token.to_string()),
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+    append_stream(tokens, &mut parts);
+    parts
+        .into_iter()
+        .map(|(text, literal)| {
+            // Literal spelling is an indivisible leaf, never normalized as source text.
+            if literal {
+                return text;
+            }
+            let compact = text
+                .replace(" :: ", "::")
+                .replace(" (", "(")
+                .replace("( ", "(")
+                .replace(" )", ")")
+                .replace(" ,", ",")
+                .replace(" !", "!");
+            if path {
+                compact.replace("< ", "<").replace(" >", ">")
+            } else {
+                compact
+            }
+        })
+        .collect()
 }
 
 trait ToTokenStreamExt {
@@ -1248,7 +1396,7 @@ pub fn value() -> u64 {
 pub struct Word<W>(pub u128, pub std::marker::PhantomData<W>);
 impl<W> Copy for Word<W> {}
 impl<W> Clone for Word<W> { fn clone(&self) -> Self { *self } }
-pub fn unsupported() { let _bytes = [0u8; 4]; }
+pub fn unsupported() { let Some(_) = None::<u8> else { return; }; }
 "#;
         assert!(parse_rust_source(source, "Facts_Test").is_err());
         let facts = parse_rust_type_facts(source, "Facts_Test").expect("facts parse");
@@ -1377,7 +1525,7 @@ pub fn call_impl<A, B>(f: impl Fn(A) -> B, x: A) -> B {
                 Type::Generic(name, params) => {
                     assert_eq!(name, "Rc");
                     assert!(matches!(&params[0], Type::CallableTrait(callable)
-                        if callable.trait_name == "Fn"
+                        if callable.trait_path == ["Fn"]
                             && callable.args.len() == 1
                             && matches!(callable.return_type.as_ref(), Type::Named(name) if name == "B")));
                 }
@@ -1423,7 +1571,7 @@ pub fn make_pair(y: Int) -> (Rc<dyn Fn(Int) -> Int>, Int) {
         };
         assert_eq!(name, "Rc");
         assert!(matches!(&params[0], Type::CallableTrait(callable)
-            if callable.trait_name == "Fn"
+            if callable.trait_path == ["Fn"]
                 && callable.args.len() == 1
                 && matches!(callable.return_type.as_ref(), Type::Named(name) if name == "Int")));
 

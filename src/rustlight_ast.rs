@@ -128,9 +128,20 @@ pub enum Type {
 #[derive(Debug, Clone)]
 pub struct CallableTraitType {
     pub qualifier: CallableTraitQualifier,
-    pub trait_name: String,
+    /// Namespace segments of the callable trait, with an empty first segment
+    /// for an absolute path.
+    pub trait_path: Vec<String>,
     pub args: Vec<Type>,
     pub return_type: Box<Type>,
+    pub leading_bounds: Vec<CallableBound>,
+    pub trailing_bounds: Vec<CallableBound>,
+}
+
+/// A bound on the callable in addition to its call signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallableBound {
+    Lifetime(String),
+    Trait(Vec<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +359,7 @@ pub enum AttributeArg {
 pub struct Field {
     pub name: String,
     pub ty: Type,
+    pub vis: Visibility,
     pub docs: Vec<String>,
     pub attrs: Vec<Attribute>,
 }

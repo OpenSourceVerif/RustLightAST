@@ -84,3 +84,22 @@ fn row(original: Row, tag: u8, second: u8) -> Row {
     assert!(printed.contains("crate::Row { tag: new_tag, first: get(1)[0].0, second, ..original }"));
     parse_rust_source(&printed, "roundtrip").unwrap();
 }
+
+#[test]
+fn callable_types_roundtrip_qualified_traits_and_ordered_bounds() {
+    let source = r#"
+fn callback_view(value: &u32) -> Box<dyn std::ops::Fn() -> u32 + '_> {
+    Box::new(move || *value)
+}
+fn observe(callback: &(dyn std::ops::Fn() -> u32 + '_)) -> u32 { callback() }
+fn factory() -> impl ::core::clone::Clone + std::ops::Fn(u32) -> u32 + 'static {
+    |value| value
+}
+"#;
+    let module = parse_rust_source(source, "callable").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    assert!(printed.contains("Box<dyn std::ops::Fn() -> u32 + '_>"));
+    assert!(printed.contains("&(dyn std::ops::Fn() -> u32 + '_)"));
+    assert!(printed.contains("impl ::core::clone::Clone + std::ops::Fn(u32) -> u32 + 'static"));
+    parse_rust_source(&printed, "roundtrip").unwrap();
+}
