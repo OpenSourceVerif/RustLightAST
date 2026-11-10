@@ -51,7 +51,6 @@ fn explicit_enum_discriminants_survive_printing() {
 fn unsupported_substructure_never_disappears_from_preserved_source() {
     let cases = [
         ("struct Buf<const N: usize>([u8; N]);", "const N"),
-        ("struct Alias<T = u8>(T);", "T = u8"),
         ("fn f(#[cfg(any())] x: u8) {}", "#[cfg"),
         ("fn f() { #[cfg(any())] missing(); }", "#[cfg"),
         ("fn f() { let c = async || 1; }", "async ||"),

@@ -619,7 +619,13 @@ fn trait_defaults_are_editable_without_changing_other_members() {
     assert_eq!(default.name, "current");
     default.body.expr = Some(Box::new(Expr::Literal(Literal::Int(19))));
 
-    assert!(matches!(module.items[2], Item::Raw(_)));
+    let Item::Trait(with_default) = &module.items[2] else {
+        panic!("expected a modeled type parameter default");
+    };
+    assert!(matches!(
+        with_default.generics.params[0].type_parameter().unwrap().default,
+        Some(Type::Named(ref name)) if name == "u32"
+    ));
     let printed = RustCodeGenerator::new().generate_module_code(&module);
     let actual = syn::parse_file(&printed).unwrap();
     let expected = syn::parse_file(source).unwrap();
@@ -638,7 +644,12 @@ fn trait_defaults_are_editable_without_changing_other_members() {
     };
     assert_eq!(header(actual_view), header(expected_view));
     assert_eq!(tokens(actual_marker), tokens(expected_marker));
-    assert_eq!(tokens(actual_fallback), tokens(expected_fallback));
+    let (syn::Item::Trait(actual_fallback), syn::Item::Trait(expected_fallback)) =
+        (actual_fallback, expected_fallback)
+    else {
+        panic!("expected the trait with a type parameter default");
+    };
+    assert_eq!(header(actual_fallback), header(expected_fallback));
     assert_eq!(actual_view.items.len(), expected_view.items.len());
     for (actual, expected) in actual_view.items[..4].iter().zip(&expected_view.items[..4]) {
         assert_eq!(tokens(actual), tokens(expected));
@@ -649,4 +660,34 @@ fn trait_defaults_are_editable_without_changing_other_members() {
     assert!(method.sig.unsafety.is_some());
     assert_eq!(tokens(&method.attrs[0]), "# [inline]");
     assert_eq!(tokens(method.default.as_ref().unwrap()), "{ 19 }");
+}
+
+#[test]
+fn models_and_roundtrips_pointer_types_and_type_parameter_defaults() {
+    use quote::ToTokens;
+    use rustlightast::{FunctionAbi, PointerKind};
+
+    let source = r#"
+        type Callback<T = u32> = for<'a> unsafe extern "C" fn(
+            data: *const T, reference: &'a mut T, args: ...
+        ) -> *mut T;
+        type NoResult = fn(u32);
+    "#;
+    let module = parse_rust_source(source, "pointer_types").unwrap();
+    let Item::TypeAlias(alias) = &module.items[0] else {
+        panic!("expected a modeled alias");
+    };
+    let Type::BareFn(function) = &alias.target else {
+        panic!("expected a bare function type");
+    };
+    assert!(function.unsafety);
+    assert!(matches!(&function.abi, Some(FunctionAbi::Named(name)) if name == "C"));
+    assert_eq!(function.higher_ranked[0].name, "'a");
+    assert!(matches!(function.inputs[0].ty, Type::RawPointer(_, PointerKind::Const)));
+    assert!(matches!(function.output, Some(Type::RawPointer(_, PointerKind::Mut))));
+    assert_eq!(function.variadic.as_ref().unwrap().name.as_deref(), Some("args"));
+
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    let tokens = |source: &str| syn::parse_file(source).unwrap().to_token_stream().to_string();
+    assert_eq!(tokens(&printed), tokens(source));
 }

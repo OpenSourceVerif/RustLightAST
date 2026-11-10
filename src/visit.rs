@@ -146,7 +146,12 @@ pub fn walk_generics<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, generics: &
                     visitor.visit_expr(default);
                 }
             }
-            GenericParam::Type(_) | GenericParam::Lifetime(_) => {}
+            GenericParam::Type(parameter) => {
+                if let Some(default) = &parameter.default {
+                    visitor.visit_type(default);
+                }
+            }
+            GenericParam::Lifetime(_) => {}
         }
     }
     for predicate in &generics.where_predicates {
@@ -392,7 +397,16 @@ pub fn walk_type<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, ty: &'ast Type)
                 visitor.visit_type(&binding.ty);
             }
         }
-        Type::Reference(ty, _, _) | Type::Slice(ty) | Type::Array(ty, _) => {
+        Type::BareFn(function) => {
+            for input in &function.inputs {
+                visitor.visit_type(&input.ty);
+            }
+            if let Some(output) = &function.output {
+                visitor.visit_type(output);
+            }
+        }
+        Type::Reference(ty, _, _) | Type::RawPointer(ty, _)
+        | Type::Slice(ty) | Type::Array(ty, _) => {
             visitor.visit_type(ty);
         }
         Type::Path(_) | Type::Named(_) | Type::Unit | Type::Never | Type::Infer => {}

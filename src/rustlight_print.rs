@@ -407,11 +407,7 @@ impl RustCodeGenerator {
 
         self.generate_attributes(&f.attrs, false);
 
-        let abi = match &f.qualifiers.abi {
-            Some(FunctionAbi::Default) => "extern ".to_string(),
-            Some(FunctionAbi::Named(name)) => format!("extern {name:?} "),
-            None => String::new(),
-        };
+        let abi = Self::abi_prefix(f.qualifiers.abi.as_ref());
         let head = format!(
             "{}{}{}{}{}fn {}{}",
             self.visibility(&f.vis),
@@ -478,7 +474,9 @@ impl RustCodeGenerator {
                 out.push_str(", ");
             }
             match generic {
-                GenericParam::Type(parameter) => out.push_str(&parameter.name),
+                GenericParam::Type(parameter) => {
+                    out.push_str(&self.type_parameter_to_string(parameter, false));
+                }
                 GenericParam::Lifetime(_) | GenericParam::Const { .. } => {
                     out.push_str(&self.generic_param_to_string(generic));
                 }
@@ -490,6 +488,7 @@ impl RustCodeGenerator {
 
     fn generic_param_to_string(&self, generic: &GenericParam) -> String {
         match generic {
+            GenericParam::Type(parameter) => self.type_parameter_to_string(parameter, true),
             GenericParam::Const { name, ty, default } => {
                 let mut parameter = format!("const {name}: {}", self.type_to_string(ty));
                 if let Some(value) = default {
@@ -500,6 +499,19 @@ impl RustCodeGenerator {
             }
             _ => bounded_name(generic.name(), generic.bounds()),
         }
+    }
+
+    fn type_parameter_to_string(&self, parameter: &TypeParameter, inline_bounds: bool) -> String {
+        let mut source = if inline_bounds {
+            bounded_name(&parameter.name, &parameter.bounds)
+        } else {
+            parameter.name.clone()
+        };
+        if let Some(default) = &parameter.default {
+            source.push_str(" = ");
+            source.push_str(&self.type_to_string(default));
+        }
+        source
     }
 
     fn params_to_string(&self, params: &[Param]) -> String {
@@ -1423,6 +1435,73 @@ impl RustCodeGenerator {
         self.writeln("]");
     }
 
+    fn abi_prefix(abi: Option<&FunctionAbi>) -> String {
+        match abi {
+            Some(FunctionAbi::Default) => "extern ".to_string(),
+            Some(FunctionAbi::Named(name)) => format!("extern {name:?} "),
+            None => String::new(),
+        }
+    }
+
+    fn bare_fn_param_to_string(&self, attrs: &[Attribute], name: Option<&str>, ty: &str) -> String {
+        let mut generator = Self::new();
+        generator.generate_attributes(attrs, false);
+        if let Some(name) = name {
+            generator.write(name);
+            generator.write(": ");
+        }
+        generator.write(ty);
+        generator.buffer
+    }
+
+    fn bare_fn_to_string(&self, function: &BareFnType) -> String {
+        let mut source = String::new();
+        if !function.higher_ranked.is_empty() {
+            let binder = function
+                .higher_ranked
+                .iter()
+                .map(|parameter| bounded_name(&parameter.name, &parameter.bounds))
+                .collect::<Vec<_>>()
+                .join(", ");
+            source.push_str(&format!("for<{binder}> "));
+        }
+        if function.unsafety {
+            source.push_str("unsafe ");
+        }
+        source.push_str(&Self::abi_prefix(function.abi.as_ref()));
+        let mut args = function
+            .inputs
+            .iter()
+            .map(|param| {
+                self.bare_fn_param_to_string(
+                    &param.attrs,
+                    param.name.as_deref(),
+                    &self.type_to_string(&param.ty),
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(variadic) = &function.variadic {
+            args.push(self.bare_fn_param_to_string(&variadic.attrs, variadic.name.as_deref(), "..."));
+        }
+        source.push_str(&format!("fn({})", args.join(", ")));
+        if let Some(output) = &function.output {
+            source.push_str(" -> ");
+            source.push_str(&self.type_to_string(output));
+        }
+        source
+    }
+
+    fn pointee_to_string(&self, ty: &Type) -> String {
+        let source = self.type_to_string(ty);
+        if matches!(ty, Type::CallableTrait(callable)
+            if !callable.leading_bounds.is_empty() || !callable.trailing_bounds.is_empty())
+        {
+            format!("({source})")
+        } else {
+            source
+        }
+    }
+
     fn type_to_string(&self, ty: &Type) -> String {
         match ty {
             Type::Path(path) => path.join("::"),
@@ -1488,18 +1567,19 @@ impl RustCodeGenerator {
                 }
                 source
             }
+            Type::BareFn(function) => self.bare_fn_to_string(function),
+            Type::RawPointer(inner, kind) => {
+                let qualifier = match kind {
+                    PointerKind::Const => "const",
+                    PointerKind::Mut => "mut",
+                };
+                format!("*{qualifier} {}", self.pointee_to_string(inner))
+            }
             Type::Reference(inner, lifetime, mutable) => {
                 let (lifetime, separator) =
                     lifetime.as_deref().map_or(("", ""), |name| (name, " "));
                 let mutable = if *mutable { "mut " } else { "" };
-                let source = self.type_to_string(inner);
-                if matches!(inner.as_ref(), Type::CallableTrait(callable)
-                        if !callable.leading_bounds.is_empty() || !callable.trailing_bounds.is_empty())
-                {
-                    format!("&{lifetime}{separator}{mutable}({source})")
-                } else {
-                    format!("&{lifetime}{separator}{mutable}{source}")
-                }
+                format!("&{lifetime}{separator}{mutable}{}", self.pointee_to_string(inner))
             }
             Type::Tuple(types) => {
                 let mut s = "(".to_string();
@@ -1845,6 +1925,7 @@ mod tests {
                 generics: vec![GenericParam::Type(TypeParameter {
                     name: "T".to_string(),
                     bounds: vec!["Clone".to_string()],
+                    default: None,
                 })]
                 .into(),
                 vis: Visibility::Public,

@@ -158,6 +158,8 @@ pub enum Type {
     Named(String),                    // i32, String
     Generic(String, Vec<Type>),       // HashMap<K, V>
     CallableTrait(CallableTraitType), // dyn Fn(A) -> B / impl Fn(A) -> B
+    BareFn(Box<BareFnType>),
+    RawPointer(Box<Type>, PointerKind),
     ImplTrait {
         trait_path: Vec<String>,
         associated_types: Vec<AssociatedTypeBinding>,
@@ -170,6 +172,36 @@ pub enum Type {
     Unit,                    // ()
     Never,                   // !
     Infer,                   // _
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerKind {
+    Const,
+    Mut,
+}
+
+/// A bare function pointer. An omitted result type has Rust's unit semantics.
+#[derive(Debug, Clone)]
+pub struct BareFnType {
+    pub higher_ranked: Vec<LifetimeParameter>,
+    pub unsafety: bool,
+    pub abi: Option<FunctionAbi>,
+    pub inputs: Vec<BareFnParam>,
+    pub variadic: Option<BareFnVariadic>,
+    pub output: Option<Type>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BareFnParam {
+    pub attrs: Vec<Attribute>,
+    pub name: Option<String>,
+    pub ty: Type,
+}
+
+#[derive(Debug, Clone)]
+pub struct BareFnVariadic {
+    pub attrs: Vec<Attribute>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -675,6 +707,7 @@ pub enum GenericParam {
 pub struct TypeParameter {
     pub name: String,
     pub bounds: Vec<String>,
+    pub default: Option<Type>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

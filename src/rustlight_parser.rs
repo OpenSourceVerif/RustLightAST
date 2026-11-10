@@ -402,10 +402,7 @@ fn convert_function(
         qualifiers: FunctionQualifiers {
             constness: signature.constness.is_some(),
             unsafety: signature.unsafety.is_some(),
-            abi: signature.abi.as_ref().map(|abi| match &abi.name {
-                Some(name) => FunctionAbi::Named(name.value()),
-                None => FunctionAbi::Default,
-            }),
+            abi: signature.abi.as_ref().map(convert_abi),
         },
         vis: convert_visibility(visibility),
         docs,
@@ -573,6 +570,15 @@ pub fn convert_type(ty: &SynType) -> syn::Result<Type> {
             }
             convert_type_path(&type_path.path)
         }
+        SynType::BareFn(function) => convert_bare_fn(function),
+        SynType::Ptr(pointer) => Ok(Type::RawPointer(
+            Box::new(convert_type(&pointer.elem)?),
+            if pointer.mutability.is_some() {
+                crate::PointerKind::Mut
+            } else {
+                crate::PointerKind::Const
+            },
+        )),
         SynType::Reference(TypeReference {
             elem,
             lifetime,
@@ -621,6 +627,57 @@ pub fn convert_type(ty: &SynType) -> syn::Result<Type> {
             "unsupported type syntax in RustLightAST parser",
         )),
     }
+}
+
+fn convert_abi(abi: &syn::Abi) -> FunctionAbi {
+    match &abi.name {
+        Some(name) => FunctionAbi::Named(name.value()),
+        None => FunctionAbi::Default,
+    }
+}
+
+fn convert_bare_fn(function: &syn::TypeBareFn) -> syn::Result<Type> {
+    let higher_ranked = function
+        .lifetimes
+        .iter()
+        .flat_map(|binder| &binder.lifetimes)
+        .map(|parameter| match parameter {
+            syn::GenericParam::Lifetime(lifetime) if lifetime.attrs.is_empty() => {
+                Ok(convert_lifetime_param(lifetime))
+            }
+            other => Err(syn::Error::new_spanned(
+                other,
+                "unsupported bare function lifetime parameter",
+            )),
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+    let inputs = function
+        .inputs
+        .iter()
+        .map(|input| {
+            Ok(crate::BareFnParam {
+                attrs: convert_attributes(&input.attrs),
+                name: input.name.as_ref().map(|(name, _)| name.to_string()),
+                ty: convert_type(&input.ty)?,
+            })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+    let variadic = function.variadic.as_ref().map(|argument| crate::BareFnVariadic {
+        attrs: convert_attributes(&argument.attrs),
+        name: argument.name.as_ref().map(|(name, _)| name.to_string()),
+    });
+    let output = match &function.output {
+        ReturnType::Default => None,
+        ReturnType::Type(_, ty) => Some(convert_type(ty)?),
+    };
+    Ok(Type::BareFn(Box::new(crate::BareFnType {
+        higher_ranked,
+        unsafety: function.unsafety.is_some(),
+        abi: function.abi.as_ref().map(convert_abi),
+        inputs,
+        variadic,
+        output,
+    })))
 }
 
 fn convert_associated_impl_trait(bound: &TraitBound) -> syn::Result<Option<Type>> {
@@ -1490,11 +1547,10 @@ fn convert_generics(generics: &syn::Generics) -> syn::Result<Generics> {
         .params
         .iter()
         .map(|param| match param {
-            syn::GenericParam::Type(type_param)
-                if type_param.attrs.is_empty() && type_param.default.is_none() =>
-            {
+            syn::GenericParam::Type(type_param) if type_param.attrs.is_empty() => {
                 Ok(GenericParam::Type(TypeParameter {
                     name: type_param.ident.to_string(),
+                    default: type_param.default.as_ref().map(convert_type).transpose()?,
                     bounds: type_param
                         .bounds
                         .iter()
