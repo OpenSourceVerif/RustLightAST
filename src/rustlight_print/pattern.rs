@@ -1,4 +1,4 @@
-use super::RustCodeGenerator;
+use super::{ExpressionPosition, RustCodeGenerator};
 use crate::{BindingMode, Member, Pattern, PatternField};
 
 impl RustCodeGenerator {
@@ -30,6 +30,10 @@ impl RustCodeGenerator {
             }
             Pattern::Path(path) => self.generate_path(path),
             Pattern::Literal(literal) => self.generate_literal(literal),
+            Pattern::Range { start, end } => {
+                self.generate_range(start.as_deref(), end, ExpressionPosition::Free);
+            }
+            Pattern::Opaque(source) => self.write(source),
             Pattern::Wildcard => self.write("_"),
             Pattern::Rest => self.write(".."),
             Pattern::Tuple(patterns) => {
@@ -95,7 +99,7 @@ impl RustCodeGenerator {
     }
 
     fn generate_pattern_operand(&mut self, pattern: &Pattern) {
-        if matches!(pattern, Pattern::Or(_)) {
+        if matches!(pattern, Pattern::Or(_) | Pattern::Range { .. }) {
             self.write("(");
             self.generate_pattern(pattern);
             self.write(")");

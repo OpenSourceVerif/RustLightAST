@@ -1,4 +1,4 @@
-use super::{Literal, Member, Type};
+use super::{Expr, Literal, Member, RangeEnd, Type};
 
 /// A Rust pattern used by bindings, parameters, and match arms.
 #[derive(Debug, Clone)]
@@ -12,6 +12,12 @@ pub enum Pattern {
     },
     Path(Vec<String>),
     Literal(Literal),
+    Range {
+        start: Option<Box<Expr>>,
+        end: RangeEnd,
+    },
+    /// Source retained when a supported expression contains an unmodeled pattern.
+    Opaque(String),
     Wildcard,
     Rest,
     Tuple(Vec<Pattern>),

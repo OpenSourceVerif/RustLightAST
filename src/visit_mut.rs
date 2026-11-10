@@ -267,7 +267,8 @@ impl<C: Callback> Expressions<C> {
             | Expr::Cast(inner, _)
             | Expr::Await(inner)
             | Expr::Closure(_, inner, _)
-            | Expr::TypedClosure(_, _, inner, _) => self.expression(inner),
+            | Expr::TypedClosure(_, _, inner, _)
+            | Expr::AsyncClosure { body: inner, .. } => self.expression(inner),
             Expr::BinaryOp(left, _, right)
             | Expr::Index(left, right)
             | Expr::Assign(left, right) => {

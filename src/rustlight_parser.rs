@@ -1162,6 +1162,9 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 move_capture: expr.capture.is_some(),
             })
         }
+        syn::Expr::Await(expr) if expr.attrs.is_empty() => {
+            Ok(Expr::Await(Box::new(convert_expr(&expr.base)?)))
+        }
         syn::Expr::Try(expr) if expr.attrs.is_empty() => {
             Ok(Expr::Try(Box::new(convert_expr(&expr.expr)?)))
         }
@@ -1170,21 +1173,7 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
             len: Box::new(convert_expr(&expr.len)?),
         }),
         syn::Expr::Range(expr) if expr.attrs.is_empty() => {
-            let bound = |bound: Option<&syn::Expr>| {
-                bound
-                    .map(|bound| convert_expr(bound).map(Box::new))
-                    .transpose()
-            };
-            let start = bound(expr.start.as_deref())?;
-            let end = bound(expr.end.as_deref())?;
-            let end = match expr.limits {
-                syn::RangeLimits::HalfOpen(_) => crate::RangeEnd::Exclusive(end),
-                syn::RangeLimits::Closed(_) => {
-                    crate::RangeEnd::Inclusive(end.ok_or_else(|| {
-                        syn::Error::new_spanned(expr, "inclusive range requires an end expression")
-                    })?)
-                }
-            };
+            let (start, end) = convert_range(expr)?;
             Ok(Expr::Range { start, end })
         }
         syn::Expr::Paren(ExprParen { attrs, expr, .. })
@@ -1230,7 +1219,9 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 .transpose()?;
             match cond.as_ref() {
                 syn::Expr::Let(condition) if condition.attrs.is_empty() => Ok(Expr::IfLet {
-                    pattern: normalize_tokens(condition.pat.to_token_stream()),
+                    pattern: convert_pattern(&condition.pat).unwrap_or_else(|_| {
+                        crate::Pattern::Opaque(normalize_tokens(condition.pat.to_token_stream()))
+                    }),
                     value: Box::new(convert_expr(&condition.expr)?),
                     then_branch,
                     else_branch,
@@ -1303,7 +1294,7 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         syn::Expr::Closure(ExprClosure {
             attrs,
             capture,
-            asyncness: None,
+            asyncness,
             constness: None,
             lifetimes: None,
             movability: None,
@@ -1318,6 +1309,18 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 .map(convert_closure_param)
                 .collect::<syn::Result<Vec<_>>>()?;
             let body = Box::new(convert_expr(body)?);
+            if asyncness.is_some() {
+                let return_type = match output {
+                    ReturnType::Default => None,
+                    ReturnType::Type(_, ty) => Some(convert_type(ty)?),
+                };
+                return Ok(Expr::AsyncClosure {
+                    params,
+                    return_type,
+                    body,
+                    move_capture: is_move,
+                });
+            }
             match output {
                 ReturnType::Default => Ok(Expr::Closure(params, body, is_move)),
                 ReturnType::Type(_, ty) => {
@@ -1533,6 +1536,23 @@ pub fn first_explicit_type_argument(segment: &str) -> Option<Type> {
         GenericArgument::Type(ty) => convert_type(ty).ok(),
         _ => None,
     })
+}
+
+fn convert_range(range: &syn::ExprRange) -> syn::Result<(Option<Box<Expr>>, crate::RangeEnd)> {
+    let bound = |bound: Option<&syn::Expr>| {
+        bound
+            .map(|bound| convert_expr(bound).map(Box::new))
+            .transpose()
+    };
+    let start = bound(range.start.as_deref())?;
+    let end = bound(range.end.as_deref())?;
+    let end = match range.limits {
+        syn::RangeLimits::HalfOpen(_) => crate::RangeEnd::Exclusive(end),
+        syn::RangeLimits::Closed(_) => crate::RangeEnd::Inclusive(end.ok_or_else(|| {
+            syn::Error::new_spanned(range, "inclusive range requires an end expression")
+        })?),
+    };
+    Ok((start, end))
 }
 
 fn convert_literal(lit: &Lit) -> syn::Result<Literal> {

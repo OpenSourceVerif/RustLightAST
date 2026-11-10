@@ -48,7 +48,8 @@ impl Precedence {
 
     fn of(expr: &Expr) -> Self {
         match expr {
-            Expr::Closure(..)
+            Expr::AsyncClosure { .. }
+            | Expr::Closure(..)
             | Expr::TypedClosure(..)
             | Expr::Return(..)
             | Expr::Break { .. }
@@ -658,6 +659,59 @@ impl RustCodeGenerator {
         }
     }
 
+    fn generate_closure(
+        &mut self,
+        params: &[ClosureParam],
+        return_type: Option<&Type>,
+        body: &Expr,
+        move_capture: bool,
+        position: ExpressionPosition,
+    ) {
+        if move_capture {
+            self.write("move ");
+        }
+        self.write("|");
+        for (index, param) in params.iter().enumerate() {
+            if index > 0 {
+                self.write(", ");
+            }
+            self.generate_closure_param(param);
+        }
+        self.write("| ");
+        if let Some(return_type) = return_type {
+            self.write("-> ");
+            self.write(&self.type_to_string(return_type));
+            self.write(" ");
+            if matches!(body, Expr::Block(_)) {
+                self.generate_expr(body);
+            } else {
+                self.write("{ ");
+                self.generate_expr(body);
+                self.write(" }");
+            }
+        } else {
+            self.generate_expr_at(body, position.without_statement_head());
+        }
+    }
+
+    fn generate_range(
+        &mut self,
+        start: Option<&Expr>,
+        end: &RangeEnd,
+        position: ExpressionPosition,
+    ) {
+        if let Some(start) = start {
+            self.generate_operand(start, Precedence::Range, false, position);
+        }
+        self.write(match end {
+            RangeEnd::Exclusive(_) => "..",
+            RangeEnd::Inclusive(_) => "..=",
+        });
+        if let Some(end) = end.expression() {
+            self.generate_operand(end, Precedence::Range, false, position.without_statement_head());
+        }
+    }
+
     fn generate_expr(&mut self, expr: &Expr) {
         self.generate_expr_at(expr, ExpressionPosition::Free);
     }
@@ -738,23 +792,7 @@ impl RustCodeGenerator {
                 self.generate_expr(len);
                 self.write("]");
             }
-            Expr::Range { start, end } => {
-                if let Some(start) = start {
-                    self.generate_operand(start, Precedence::Range, false, position);
-                }
-                self.write(match end {
-                    RangeEnd::Exclusive(_) => "..",
-                    RangeEnd::Inclusive(_) => "..=",
-                });
-                if let Some(end) = end.expression() {
-                    self.generate_operand(
-                        end,
-                        Precedence::Range,
-                        false,
-                        position.without_statement_head(),
-                    );
-                }
-            }
+            Expr::Range { start, end } => self.generate_range(start.as_deref(), end, position),
             Expr::Try(operand) => {
                 self.generate_postfix_base(operand, position);
                 self.write("?");
@@ -892,41 +930,19 @@ impl RustCodeGenerator {
                 }
             }
             Expr::Closure(params, body, is_move) => {
-                if *is_move {
-                    self.write("move ");
-                }
-                self.write("|");
-                for (i, param) in params.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.generate_closure_param(param);
-                }
-                self.write("| ");
-                self.generate_expr_at(body, position.without_statement_head());
+                self.generate_closure(params, None, body, *is_move, position);
             }
             Expr::TypedClosure(params, return_type, body, is_move) => {
-                if *is_move {
-                    self.write("move ");
-                }
-                self.write("|");
-                for (i, param) in params.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.generate_closure_param(param);
-                }
-                self.write("| -> ");
-                self.write(&self.type_to_string(return_type));
-                self.write(" ");
-                match body.as_ref() {
-                    Expr::Block(_) => self.generate_expr(body),
-                    _ => {
-                        self.write("{ ");
-                        self.generate_expr(body);
-                        self.write(" }");
-                    }
-                }
+                self.generate_closure(params, Some(return_type), body, *is_move, position);
+            }
+            Expr::AsyncClosure {
+                params,
+                return_type,
+                body,
+                move_capture,
+            } => {
+                self.write("async ");
+                self.generate_closure(params, return_type.as_ref(), body, *move_capture, position);
             }
             Expr::Match { expr, arms } => {
                 self.write("match ");
@@ -1034,7 +1050,7 @@ impl RustCodeGenerator {
                 else_branch,
             } => {
                 self.write("if let ");
-                self.write(pattern);
+                self.generate_pattern(pattern);
                 self.write(" = ");
                 self.generate_let_scrutinee(value, ExpressionPosition::BeforeBlock);
                 self.write(" {\n");

@@ -285,13 +285,17 @@ pub fn walk_expr<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, expression: &'a
                 visitor.visit_expr(value);
             }
         }
-        Expr::Closure(params, body, _) | Expr::TypedClosure(params, _, body, _) => {
+        Expr::Closure(params, body, _)
+        | Expr::TypedClosure(params, _, body, _)
+        | Expr::AsyncClosure { params, body, .. } => {
             for param in params {
                 if let Some(ty) = &param.ty {
                     visitor.visit_type(ty);
                 }
             }
-            if let Expr::TypedClosure(_, output, _, _) = expression {
+            if let Expr::TypedClosure(_, output, _, _)
+            | Expr::AsyncClosure { return_type: Some(output), .. } = expression
+            {
                 visitor.visit_type(output);
             }
             visitor.visit_expr(body);
@@ -315,6 +319,9 @@ pub fn walk_expr<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, expression: &'a
             else_branch,
             ..
         } => {
+            if let Expr::IfLet { pattern, .. } = expression {
+                visitor.visit_pattern(pattern);
+            }
             visitor.visit_expr(value);
             visitor.visit_block(then_branch);
             if let Some(block) = else_branch {
@@ -373,7 +380,12 @@ pub fn walk_pattern<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, pattern: &'a
         Pattern::Reference { pattern, .. } | Pattern::Parenthesized(pattern) => {
             visitor.visit_pattern(pattern);
         }
-        Pattern::Path(_) | Pattern::Literal(_) | Pattern::Wildcard | Pattern::Rest => {}
+        Pattern::Range { start, end } => {
+            for bound in start.as_deref().into_iter().chain(end.expression()) {
+                visitor.visit_expr(bound);
+            }
+        }
+        Pattern::Path(_) | Pattern::Literal(_) | Pattern::Opaque(_) | Pattern::Wildcard | Pattern::Rest => {}
     }
 }
 

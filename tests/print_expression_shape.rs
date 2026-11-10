@@ -180,7 +180,7 @@ fn groups_struct_literals_exposed_in_control_flow_heads() {
     );
     check_shape(
         &Expr::IfLet {
-            pattern: "S { n: 1 }".into(),
+            pattern: rustlightast::parse_rust_pattern("S { n: 1 }").unwrap(),
             value: record(),
             then_branch: empty(),
             else_branch: None,
@@ -208,7 +208,7 @@ fn groups_struct_literals_exposed_in_control_flow_heads() {
 fn keeps_lazy_boolean_operators_inside_let_scrutinees() {
     check_shape(
         &Expr::IfLet {
-            pattern: "false".into(),
+            pattern: Pattern::Literal(Literal::Bool(false)),
             value: binary(name("a"), "&&", name("b")),
             then_branch: Block {
                 stmts: vec![],
@@ -218,4 +218,41 @@ fn keeps_lazy_boolean_operators_inside_let_scrutinees() {
         },
         "if let false = (a && b) {}",
     );
+}
+
+#[test]
+fn preserves_async_closure_and_if_let_patterns() {
+    use rustlightast::rustlight_parser::convert_expr;
+
+    let source = "async move || -> u32 { if let Some(n) = value { n } else { 0 } }";
+    let parsed = syn::parse_str::<syn::Expr>(source).unwrap();
+    let modeled = convert_expr(&parsed).unwrap();
+    let Expr::AsyncClosure {
+        body,
+        move_capture: true,
+        return_type: Some(_),
+        ..
+    } = &modeled
+    else {
+        panic!("expected a typed move async closure");
+    };
+    assert!(matches!(
+        body.as_ref(),
+        Expr::Block(block) if matches!(
+            block.expr.as_deref(),
+            Some(Expr::IfLet { pattern: Pattern::TupleStruct { .. }, .. })
+        )
+    ));
+    check_shape(&modeled, source);
+
+    let opaque = "if let pattern!() = value {}";
+    let modeled = convert_expr(&syn::parse_str(opaque).unwrap()).unwrap();
+    assert!(matches!(
+        &modeled,
+        Expr::IfLet {
+            pattern: Pattern::Opaque(_),
+            ..
+        }
+    ));
+    check_shape(&modeled, opaque);
 }

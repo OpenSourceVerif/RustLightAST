@@ -382,6 +382,12 @@ pub enum Expr {
     Closure(Vec<ClosureParam>, Box<Expr>, bool),
     /// A closure whose explicit Rust return type must survive parse/print.
     TypedClosure(Vec<ClosureParam>, Type, Box<Expr>, bool),
+    AsyncClosure {
+        params: Vec<ClosureParam>,
+        return_type: Option<Type>,
+        body: Box<Expr>,
+        move_capture: bool,
+    },
     BuilderChain(Vec<BuilderMethod>), // represents builder-style chained calls
     Unsafe(Box<Block>),               // unsafe expression support
     If {
@@ -390,7 +396,7 @@ pub enum Expr {
         else_branch: Option<Block>,
     }, // conditional expression
     IfLet {
-        pattern: String,
+        pattern: Pattern,
         value: Box<Expr>,
         then_branch: Block,
         else_branch: Option<Block>,

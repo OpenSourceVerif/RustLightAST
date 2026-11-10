@@ -1,4 +1,6 @@
-use super::{convert_literal, convert_member, convert_type, path_segments, ParseError};
+use super::{
+    convert_literal, convert_member, convert_range, convert_type, path_segments, ParseError,
+};
 use crate::{BindingMode, Pattern, PatternField};
 use syn::{
     parse::{ParseStream, Parser},
@@ -45,6 +47,10 @@ pub fn convert_pattern(pattern: &Pat) -> syn::Result<Pattern> {
         }
         Pat::Lit(literal) if literal.attrs.is_empty() => {
             Ok(Pattern::Literal(convert_literal(&literal.lit)?))
+        }
+        Pat::Range(range) if range.attrs.is_empty() => {
+            let (start, end) = convert_range(range)?;
+            Ok(Pattern::Range { start, end })
         }
         Pat::Wild(wildcard) if wildcard.attrs.is_empty() => Ok(Pattern::Wildcard),
         Pat::Rest(rest) if rest.attrs.is_empty() => Ok(Pattern::Rest),

@@ -53,7 +53,7 @@ fn unsupported_substructure_never_disappears_from_preserved_source() {
         ("struct Buf<const N: usize>([u8; N]);", "const N"),
         ("fn f(#[cfg(any())] x: u8) {}", "#[cfg"),
         ("fn f() { #[cfg(any())] missing(); }", "#[cfg"),
-        ("fn f() { let c = async || 1; }", "async ||"),
+        ("fn f(x: u8) { let _p = &raw const x; }", "&raw const"),
         (
             "fn f() { match true { #[cfg(any())] false => (), _ => () } }",
             "#[cfg",
