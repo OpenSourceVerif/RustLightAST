@@ -101,12 +101,27 @@ fn binary_operations_keep_leading_blocks_in_statements_and_tails() {
 
 #[test]
 fn unsupported_body_still_allows_marked_type_fact_recovery() {
-    let source = "pub fn bytes() -> [u8; 4] { const { [0u8; 4] } }";
+    let source = r#"
+        pub struct Word<W>(pub u128, pub std::marker::PhantomData<W>);
+        impl<W> Copy for Word<W> {}
+        impl<W> Clone for Word<W> { fn clone(&self) -> Self { *self } }
+        pub fn bytes() -> [u8; 4] { const { [0u8; 4] } }
+    "#;
     let _: ParseError = parse_rust_source(source, "example").unwrap_err();
     let facts = parse_rust_type_facts(source, "example").unwrap();
-    let Item::Function(function) = &facts.items[0] else {
-        panic!("expected recovered signature");
+    let [Item::Struct(word), Item::Impl(copy), Item::Function(function)] =
+        facts.items.as_slice()
+    else {
+        panic!("expected only the struct, Copy impl and recovered signature");
     };
+    assert_eq!(word.name, "Word");
+    assert!(matches!(
+        &copy.trait_impl,
+        Some(Type::Named(name)) if name == "Copy"
+    ) || matches!(
+        &copy.trait_impl,
+        Some(Type::Path(path)) if path.last().is_some_and(|name| name == "Copy")
+    ));
     assert!(function.docs.iter().any(|doc| doc == TYPE_FACT_ONLY_DOC));
     assert!(matches!(&function.return_type, Type::Array(_, 4)));
     assert!(function.body.stmts.is_empty());
@@ -189,7 +204,8 @@ macro_rules! add {
     ($out:ident, $value:expr) => { $out = $out + $value; };
 }
 fn total() -> u32 {
-    let mut sum = 0;
+    macro_rules! zero { () => { 0 }; }
+    let mut sum = zero!();
     #[cfg(any())]
     crate::add!(sum, 100);
     crate::add!(sum, (1));
@@ -202,6 +218,9 @@ fn total() -> u32 {
     let module = parse_rust_source(source, "macros").unwrap();
     let printed = RustCodeGenerator::new().generate_module_code(&module);
     let reparsed = parse_rust_source(&printed, "roundtrip").unwrap();
+    let compact: String = printed.split_whitespace().collect();
+    assert!(compact.contains("macro_rules!zero"), "{printed}");
+    assert!(compact.contains("letmutsum=zero!();"), "{printed}");
 
     for module in [&module, &reparsed] {
         let function = module

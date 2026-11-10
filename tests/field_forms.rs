@@ -6,6 +6,7 @@ fn field_forms_and_variant_attributes_survive_roundtrip() {
     let source = r#"
         struct Unit;
         struct EmptyTuple();
+        struct Signed<A>(PhantomData<A>);
         struct EmptyRecord {}
 
         #[derive(Default)]
@@ -21,13 +22,14 @@ fn field_forms_and_variant_attributes_survive_roundtrip() {
     let output = RustCodeGenerator::new().generate_module_code(&module);
     let file = syn::parse_file(&output).unwrap();
 
-    let [Item::Struct(unit), Item::Struct(tuple), Item::Struct(record), Item::Enum(event)] =
+    let [Item::Struct(unit), Item::Struct(tuple), Item::Struct(signed), Item::Struct(record), Item::Enum(event)] =
         file.items.as_slice()
     else {
         panic!("unexpected declarations: {output}");
     };
     assert!(matches!(unit.fields, Fields::Unit));
     assert!(matches!(&tuple.fields, Fields::Unnamed(fields) if fields.unnamed.is_empty()));
+    assert!(matches!(&signed.fields, Fields::Unnamed(fields) if fields.unnamed.len() == 1));
     assert!(matches!(&record.fields, Fields::Named(fields) if fields.named.is_empty()));
 
     let variants = &event.variants;
