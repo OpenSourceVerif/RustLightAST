@@ -156,7 +156,8 @@ pub struct TypeAlias {
 pub enum Type {
     Path(Vec<String>),                // std::vec::Vec
     Named(String),                    // i32, String
-    Generic(String, Vec<Type>),       // HashMap<K, V>
+    /// A named type applied to arguments, such as `HashMap<K, V>`.
+    Generic(String, Vec<GenericArgument>),
     CallableTrait(CallableTraitType), // dyn Fn(A) -> B / impl Fn(A) -> B
     BareFn(Box<BareFnType>),
     RawPointer(Box<Type>, PointerKind),
@@ -172,6 +173,32 @@ pub enum Type {
     Unit,                    // ()
     Never,                   // !
     Infer,                   // _
+}
+
+/// The syntax of an argument in an angle-bracketed generic argument list.
+#[derive(Debug, Clone)]
+pub enum GenericArgument {
+    /// Includes syntax shared with const arguments, such as `N` and `_`.
+    /// Resolving that syntax requires information about the generic declaration.
+    Type(Type),
+    /// Spelling including the apostrophe.
+    Lifetime(String),
+    Const(Box<Expr>),
+}
+
+impl GenericArgument {
+    pub fn as_type(&self) -> Option<&Type> {
+        match self {
+            Self::Type(ty) => Some(ty),
+            Self::Lifetime(_) | Self::Const(_) => None,
+        }
+    }
+}
+
+impl From<Type> for GenericArgument {
+    fn from(ty: Type) -> Self {
+        Self::Type(ty)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,11 +309,11 @@ pub enum PathType {
     Qualified(PathQualification),
 }
 
-/// Type arguments attached to a nonterminal namespace segment.
+/// Generic arguments attached to a namespace segment.
 #[derive(Debug, Clone)]
 pub struct PathTypeArguments {
     pub segment: usize,
-    pub arguments: Vec<Type>,
+    pub arguments: Vec<GenericArgument>,
 }
 
 /// The `<T>` or `<T as Trait>` prefix of an associated expression path.
@@ -311,7 +338,7 @@ pub enum RecordPath {
     WithTypeArguments {
         /// The final segment contains just the constructor name.
         segments: Vec<String>,
-        arguments: Vec<Type>,
+        arguments: Vec<GenericArgument>,
     },
 }
 

@@ -1,9 +1,9 @@
 //! Read-only traversal of the structured RustLight AST.
 
 use crate::{
-    Block, BuilderMethod, Expr, FunctionDef, GenericParam, Generics, ImplItem, Item, MatchArm,
-    PathType, Pattern, QualifiedSelfType, RecordPath, RustModule, Statement, TraitMember, Type,
-    WherePredicate,
+    Block, BuilderMethod, Expr, FunctionDef, GenericArgument, GenericParam, Generics, ImplItem,
+    Item, MatchArm, PathType, Pattern, QualifiedSelfType, RecordPath, RustModule, Statement,
+    TraitMember, Type, WherePredicate,
 };
 
 /// A visitor may override a node method and call its `walk_*` function to
@@ -47,6 +47,10 @@ pub trait Visit<'ast> {
 
     fn visit_type(&mut self, ty: &'ast Type) {
         walk_type(self, ty);
+    }
+
+    fn visit_generic_argument(&mut self, argument: &'ast GenericArgument) {
+        walk_generic_argument(self, argument);
     }
 }
 
@@ -205,7 +209,7 @@ pub fn walk_expr<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, expression: &'a
             PathType::NamespaceWithTypeArguments(segments) => {
                 for segment in segments {
                     for argument in &segment.arguments {
-                        visitor.visit_type(argument);
+                        visitor.visit_generic_argument(argument);
                     }
                 }
             }
@@ -225,7 +229,7 @@ pub fn walk_expr<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, expression: &'a
                 RecordPath::Segments(_) => {}
                 RecordPath::WithTypeArguments { arguments, .. } => {
                     for argument in arguments {
-                        visitor.visit_type(argument);
+                        visitor.visit_generic_argument(argument);
                     }
                 }
             }
@@ -391,7 +395,12 @@ pub fn walk_pattern<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, pattern: &'a
 
 pub fn walk_type<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, ty: &'ast Type) {
     match ty {
-        Type::Generic(_, arguments) | Type::Tuple(arguments) => {
+        Type::Generic(_, arguments) => {
+            for argument in arguments {
+                visitor.visit_generic_argument(argument);
+            }
+        }
+        Type::Tuple(arguments) => {
             for argument in arguments {
                 visitor.visit_type(argument);
             }
@@ -422,5 +431,16 @@ pub fn walk_type<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, ty: &'ast Type)
             visitor.visit_type(ty);
         }
         Type::Path(_) | Type::Named(_) | Type::Unit | Type::Never | Type::Infer => {}
+    }
+}
+
+pub fn walk_generic_argument<'ast, V: Visit<'ast> + ?Sized>(
+    visitor: &mut V,
+    argument: &'ast GenericArgument,
+) {
+    match argument {
+        GenericArgument::Type(ty) => visitor.visit_type(ty),
+        GenericArgument::Lifetime(_) => {}
+        GenericArgument::Const(expression) => visitor.visit_expr(expression),
     }
 }

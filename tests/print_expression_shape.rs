@@ -272,7 +272,8 @@ fn callable_target() -> Type {
             leading_bounds: Vec::new(),
             trailing_bounds: Vec::new(),
             higher_ranked: Vec::new(),
-        })],
+        })
+        .into()],
     )
 }
 

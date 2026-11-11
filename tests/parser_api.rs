@@ -1,7 +1,7 @@
 use rustlightast::{
     parse_rust_source, parse_rust_type_facts,
     rustlight_parser::{first_explicit_type_argument, TYPE_FACT_ONLY_DOC},
-    Expr, Item, Member, ParseError, RustCodeGenerator, Statement, Type,
+    Expr, GenericArgument, Item, Member, ParseError, RustCodeGenerator, Statement, Type,
 };
 
 #[test]
@@ -361,7 +361,7 @@ fn build() {
     else {
         panic!("expected record with explicit type arguments");
     };
-    let [Type::Generic(name, _)] = arguments.as_mut_slice() else {
+    let [GenericArgument::Type(Type::Generic(name, _))] = arguments.as_mut_slice() else {
         panic!("expected one generic type argument");
     };
     *name = "std::rc::Rc".into();
@@ -371,10 +371,18 @@ fn build() {
     assert!(printed.contains("Pending::<std::rc::Rc<u32>>"));
     parse_rust_source(&printed, "roundtrip").unwrap();
 
-    let source = syn::parse_str("Opaque::<3> {}").unwrap();
+    let source = syn::parse_str("Opaque::<{ const { 3 } }> {}").unwrap();
     let opaque = rustlightast::rustlight_parser::convert_expr(&source).unwrap();
+    assert!(matches!(
+        &opaque,
+        Expr::Record {
+            path: RecordPath::Segments(_),
+            ..
+        }
+    ));
     let printed = printer.generate_expression_code(&opaque);
-    assert!(printed.contains("Opaque::<3>"));
+    assert!(printed.contains("const"));
+    syn::parse_str::<syn::Expr>(&printed).unwrap();
 }
 
 #[test]

@@ -125,13 +125,9 @@ impl RustCodeGenerator {
                 let printer = Self::new();
                 let mut segments = path.to_vec();
                 for list in arguments {
-                    let types = list.arguments
-                        .iter()
-                        .map(|ty| printer.generate_type_code(ty))
-                        .collect::<Vec<_>>()
-                        .join(", ");
                     let segment = &mut segments[list.segment];
-                    *segment = format!("{segment}::<{types}>");
+                    segment.push_str("::");
+                    printer.append_generic_arguments(segment, &list.arguments);
                 }
                 Some(Cow::Owned(segments))
             }
@@ -139,17 +135,15 @@ impl RustCodeGenerator {
         }
     }
 
-    /// Render a record constructor path with its explicit type arguments.
+    /// Render a record constructor path with its explicit generic arguments.
     pub fn generate_record_path_code(&self, path: &RecordPath) -> String {
         match path {
             RecordPath::Segments(segments) => segments.join("::"),
             RecordPath::WithTypeArguments { segments, arguments } => {
-                let arguments = arguments
-                    .iter()
-                    .map(|argument| self.type_to_string(argument))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{}::<{arguments}>", segments.join("::"))
+                let mut source = segments.join("::");
+                source.push_str("::");
+                self.append_generic_arguments(&mut source, arguments);
+                source
             }
         }
     }
@@ -1518,21 +1512,41 @@ impl RustCodeGenerator {
         }
     }
 
+    fn append_generic_arguments(&self, source: &mut String, arguments: &[GenericArgument]) {
+        source.push('<');
+        for (index, argument) in arguments.iter().enumerate() {
+            if index > 0 {
+                source.push_str(", ");
+            }
+            match argument {
+                GenericArgument::Type(ty) => source.push_str(&self.type_to_string(ty)),
+                GenericArgument::Lifetime(lifetime) => source.push_str(lifetime),
+                GenericArgument::Const(expression) => {
+                    let expression_source = Self::new().generate_expression_code(expression);
+                    // Braces keep a rewritten identifier or expression in const syntax.
+                    let needs_braces =
+                        !matches!(expression.as_ref(), Expr::Literal(_) | Expr::Block(_));
+                    if needs_braces {
+                        source.push_str("{ ");
+                    }
+                    source.push_str(&expression_source);
+                    if needs_braces {
+                        source.push_str(" }");
+                    }
+                }
+            }
+        }
+        source.push('>');
+    }
+
     fn type_to_string(&self, ty: &Type) -> String {
         match ty {
             Type::Path(path) => path.join("::"),
             Type::Named(name) => name.clone(),
-            Type::Generic(name, params) => {
-                let mut s = name.clone();
-                s.push('<');
-                for (i, param) in params.iter().enumerate() {
-                    if i > 0 {
-                        s.push_str(", ");
-                    }
-                    s.push_str(&self.type_to_string(param));
-                }
-                s.push('>');
-                s
+            Type::Generic(name, arguments) => {
+                let mut source = name.clone();
+                self.append_generic_arguments(&mut source, arguments);
+                source
             }
             Type::ImplTrait {
                 trait_path,

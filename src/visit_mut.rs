@@ -1,4 +1,7 @@
 //! Mutable expression traversal over the RustLight AST.
+//!
+//! The block and expression walkers follow executable code. To traverse a
+//! const generic argument, pass its expression directly to [`visit_expr`].
 
 use crate::{Block, BuilderMethod, Expr, LetStmt, MacroStmt, Statement};
 

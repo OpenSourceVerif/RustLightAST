@@ -14,19 +14,19 @@ use syn::{
     parse_file, AngleBracketedGenericArguments, ExprArray, ExprAssign, ExprBinary, ExprBlock,
     ExprCall, ExprCast, ExprClosure, ExprField, ExprGroup, ExprIf, ExprIndex, ExprLit, ExprMatch,
     ExprMethodCall, ExprParen, ExprPath, ExprReference, ExprTuple, ExprUnary, File,
-    GenericArgument, ImplItem as SynImplItem, Item as SynItem, Lit, LocalInit, Meta,
-    ParenthesizedGenericArguments, Pat, PatIdent, PathArguments, ReturnType, Stmt, TraitBound,
-    Type as SynType, TypeArray, TypeGroup, TypeImplTrait, TypeParamBound, TypeParen, TypeReference,
-    TypeSlice, TypeTraitObject, TypeTuple, Visibility as SynVisibility,
+    GenericArgument as SynGenericArgument, ImplItem as SynImplItem, Item as SynItem, Lit,
+    LocalInit, Meta, ParenthesizedGenericArguments, Pat, PatIdent, PathArguments, ReturnType, Stmt,
+    TraitBound, Type as SynType, TypeArray, TypeGroup, TypeImplTrait, TypeParamBound, TypeParen,
+    TypeReference, TypeSlice, TypeTraitObject, TypeTuple, Visibility as SynVisibility,
 };
 
 use crate::{
     AssociatedTypeBinding, Attribute, Block, CallableBound, CallableTraitQualifier,
     CallableTraitType, ClosureParam, ConstDef, EnumDef, Expr, Field, FunctionAbi, FunctionDef,
-    FunctionQualifiers, GenericParam, Generics, ImplBlock, ImplItem, Item, LetStmt,
-    LifetimeParameter, Literal, MatchArm, Member, ModuleDecl, Param, PathType, RecordField,
-    RecordPath, RustModule, Statement, StructDef, Type, TypeAlias, TypeParameter, UnionDef,
-    UseKind, UseStatement, Variant, Visibility, WherePredicate,
+    FunctionQualifiers, GenericArgument, GenericParam, Generics, ImplBlock, ImplItem, Item,
+    LetStmt, LifetimeParameter, Literal, MatchArm, Member, ModuleDecl, Param, PathType,
+    RecordField, RecordPath, RustModule, Statement, StructDef, Type, TypeAlias, TypeParameter,
+    UnionDef, UseKind, UseStatement, Variant, Visibility, WherePredicate,
 };
 
 /// Marker attached to recovered function signatures with synthetic empty bodies.
@@ -683,7 +683,7 @@ fn convert_associated_impl_trait(bound: &TraitBound) -> syn::Result<Option<Type>
     }
     let mut associated_types = Vec::new();
     for argument in &arguments.args {
-        let GenericArgument::AssocType(assoc) = argument else {
+        let SynGenericArgument::AssocType(assoc) = argument else {
             return Ok(None);
         };
         if assoc.generics.is_some() {
@@ -843,16 +843,24 @@ fn is_native_callable_bound_path(path: &syn::Path, module: &str, name: &str) -> 
     }
 }
 
-fn convert_type_arguments(arguments: &AngleBracketedGenericArguments) -> syn::Result<Vec<Type>> {
+fn convert_generic_arguments(
+    arguments: &AngleBracketedGenericArguments,
+) -> syn::Result<Vec<GenericArgument>> {
     arguments
         .args
         .iter()
         .map(|argument| match argument {
-            GenericArgument::Type(ty) => convert_type(ty),
-            // DEFENSE: dropping `3` from `Model<3>` may select a default const.
+            SynGenericArgument::Type(ty) => convert_type(ty).map(GenericArgument::Type),
+            SynGenericArgument::Lifetime(lifetime) => {
+                Ok(GenericArgument::Lifetime(lifetime.to_string()))
+            }
+            SynGenericArgument::Const(expr) => {
+                Ok(GenericArgument::Const(Box::new(convert_expr(expr)?)))
+            }
+            // DEFENSE: dropping an associated type equality or constraint changes the type.
             _ => Err(syn::Error::new_spanned(
                 argument,
-                "non-type generic argument is unsupported",
+                "unsupported associated generic argument",
             )),
         })
         .collect()
@@ -878,7 +886,7 @@ fn convert_type_path(path: &syn::Path) -> syn::Result<Type> {
     }
     let generic_args = match &last.arguments {
         PathArguments::None => Vec::new(),
-        PathArguments::AngleBracketed(arguments) => convert_type_arguments(arguments)?,
+        PathArguments::AngleBracketed(arguments) => convert_generic_arguments(arguments)?,
         other => {
             return Err(syn::Error::new_spanned(
                 other,
@@ -1400,7 +1408,7 @@ fn convert_expr_path(expr_path: &ExprPath) -> syn::Result<Expr> {
         let self_type = match convert_type(&qualification.ty) {
             Ok(ty) => crate::QualifiedSelfType::Type(Box::new(ty)),
             // DEFENSE: qualified expressions previously preserved unmodeled
-            // self types such as `<Model<3>>::VALUE` in their original syntax.
+            // self types such as `<Model<T>::Item>::VALUE` in their original syntax.
             Err(_) => {
                 crate::QualifiedSelfType::Verbatim(qualification.ty.to_token_stream().to_string())
             }
@@ -1435,23 +1443,54 @@ fn convert_expr_path(expr_path: &ExprPath) -> syn::Result<Expr> {
     }
 }
 
-/// Project explicit type arguments on nonterminal expression path segments.
+/// Project modeled arguments on expression path segments.
+///
+/// A terminal turbofish with only type arguments, including nested lists,
+/// retains its path spelling for callers that resolve names using that spelling.
 pub fn namespace_type_arguments(path: &syn::Path) -> Vec<crate::PathTypeArguments> {
     let root = usize::from(path.leading_colon.is_some());
     path.segments
         .iter()
-        .take(path.segments.len().saturating_sub(1))
         .enumerate()
         .filter_map(|(segment, source)| {
             let PathArguments::AngleBracketed(arguments) = &source.arguments else {
                 return None;
             };
+            if segment + 1 == path.segments.len() && !contains_lifetime_or_const_argument(arguments)
+            {
+                return None;
+            }
             Some(crate::PathTypeArguments {
                 segment: segment + root,
-                arguments: convert_type_arguments(arguments).ok()?,
+                arguments: convert_generic_arguments(arguments).ok()?,
             })
         })
         .collect()
+}
+
+fn contains_lifetime_or_const_argument(arguments: &AngleBracketedGenericArguments) -> bool {
+    use syn::visit::{self, Visit};
+
+    #[derive(Default)]
+    struct Search {
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for Search {
+        fn visit_generic_argument(&mut self, argument: &'ast SynGenericArgument) {
+            if self.found {
+                return;
+            }
+            match argument {
+                SynGenericArgument::Lifetime(_) | SynGenericArgument::Const(_) => self.found = true,
+                _ => visit::visit_generic_argument(self, argument),
+            }
+        }
+    }
+
+    let mut search = Search::default();
+    search.visit_angle_bracketed_generic_arguments(arguments);
+    search.found
 }
 
 /// Lower a named or positional member at the Rust source boundary.
@@ -1477,11 +1516,11 @@ fn convert_record_field(field: &syn::FieldValue) -> syn::Result<RecordField> {
     })
 }
 
-/// Lower final record path type arguments when they fit the type model.
+/// Lower final record path arguments when they fit the generic argument model.
 pub fn convert_record_path(path: &syn::Path) -> RecordPath {
     if let Some(last) = path.segments.last() {
         if let PathArguments::AngleBracketed(arguments) = &last.arguments {
-            if let Ok(arguments) = convert_type_arguments(arguments) {
+            if let Ok(arguments) = convert_generic_arguments(arguments) {
                 let mut segments = path_segments(path);
                 let final_segment = segments.len() - 1;
                 segments[final_segment] = last.ident.to_string();
@@ -1520,7 +1559,7 @@ pub fn first_explicit_type_argument(segment: &str) -> Option<Type> {
         return None;
     };
     arguments.args.iter().find_map(|argument| match argument {
-        GenericArgument::Type(ty) => convert_type(ty).ok(),
+        SynGenericArgument::Type(ty) => convert_type(ty).ok(),
         _ => None,
     })
 }
