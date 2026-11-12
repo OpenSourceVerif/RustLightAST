@@ -44,8 +44,14 @@ fn read(input: Option<u32>) -> u32 {
 
     let printed = RustCodeGenerator::new().generate_module_code(&module);
     assert_eq!(
-        syn::parse_file(&printed).unwrap().to_token_stream().to_string(),
-        syn::parse_file(source).unwrap().to_token_stream().to_string(),
+        syn::parse_file(&printed)
+            .unwrap()
+            .to_token_stream()
+            .to_string(),
+        syn::parse_file(source)
+            .unwrap()
+            .to_token_stream()
+            .to_string(),
     );
 }
 
@@ -503,6 +509,58 @@ fn async_blocks_keep_capture_mode_and_body() {
 }
 
 #[test]
+fn parsed_attributes_keep_their_tokens_and_scope() {
+    use quote::ToTokens;
+
+    let source = r#"
+#[derive(Clone,)]
+#[repr(C)]
+#[derive(Copy)]
+#[doc = include_str!("struct.md")]
+struct Data(#[cfg(any())] u8, u8);
+
+#[cfg(any())]
+type Alias = u8;
+
+#[doc = "a,b"]
+const VALUE: u8 = 0;
+
+#[allow(dead_code)]
+impl Data {
+    #![allow(unused)]
+    #[cfg(any())]
+    pub const HIDDEN: u8 = 0;
+}
+
+#[export_name = "external_f"]
+#[deprecated(note = "a,b")]
+fn f() {
+    #![allow(unused)]
+}
+"#;
+    let module = parse_rust_source(source, "attributes").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    let actual = syn::parse_file(&printed).expect("printed attributes are valid Rust syntax");
+    let expected = syn::parse_file(source).unwrap();
+    for (actual, expected) in actual.items.iter().zip(&expected.items) {
+        let tokens = |item: &syn::Item| item.to_token_stream().to_string();
+        if let (syn::Item::Fn(actual), syn::Item::Fn(expected)) = (actual, expected) {
+            let attrs = |function: &syn::ItemFn| {
+                function
+                    .attrs
+                    .iter()
+                    .map(|attr| attr.to_token_stream().to_string())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(attrs(actual), attrs(expected));
+        } else {
+            assert_eq!(tokens(actual), tokens(expected));
+        }
+    }
+    assert_eq!(actual.items.len(), expected.items.len());
+}
+
+#[test]
 fn adding_a_derive_keeps_existing_names_in_their_attribute_groups() {
     use quote::ToTokens;
     use rustlightast::DataAttribute;
@@ -524,4 +582,71 @@ fn adding_a_derive_keeps_existing_names_in_their_attribute_groups() {
         actual.to_token_stream().to_string(),
         expected.to_token_stream().to_string(),
     );
+}
+
+#[test]
+fn trait_defaults_are_editable_without_changing_other_members() {
+    use quote::ToTokens;
+    use rustlightast::{Literal, TraitMember};
+
+    let source = r#"
+    #[allow(dead_code)]
+    pub(crate) unsafe trait View<T: Copy, const N: usize = 2>: Send + Sync
+    where Self: 'static {
+        #![allow(unused_variables)]
+        type Item;
+        const SIZE: usize = 2;
+        fn required(&self, value: T) -> Self::Item;
+        fn unsupported(&self, (left, right): (u32, u32)) -> u32 { left + right }
+        #[inline]
+        unsafe fn current(&self) -> u32 { 7 }
+    }
+    unsafe auto trait Marker {}
+    trait WithDefault<T = u32> {
+        fn ready() -> u32 { 1 }
+    }
+    "#;
+    let mut module = parse_rust_source(source, "traits").unwrap();
+    let Item::Trait(view) = &mut module.items[0] else {
+        panic!("expected a modeled trait");
+    };
+    let [opaque @ .., TraitMember::DefaultMethod(default)] = view.members.as_mut_slice() else {
+        panic!("expected a modeled default method");
+    };
+    assert!(opaque
+        .iter()
+        .all(|member| matches!(member, TraitMember::Raw(_))));
+    assert_eq!(default.name, "current");
+    default.body.expr = Some(Box::new(Expr::Literal(Literal::Int(19))));
+
+    assert!(matches!(module.items[2], Item::Raw(_)));
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    let actual = syn::parse_file(&printed).unwrap();
+    let expected = syn::parse_file(source).unwrap();
+    let (
+        [syn::Item::Trait(actual_view), actual_marker, actual_fallback],
+        [syn::Item::Trait(expected_view), expected_marker, expected_fallback],
+    ) = (actual.items.as_slice(), expected.items.as_slice())
+    else {
+        panic!("expected both traits in the printed source");
+    };
+    let tokens = |node: &dyn ToTokens| node.to_token_stream().to_string();
+    let header = |item: &syn::ItemTrait| {
+        let mut item = item.clone();
+        item.items.clear();
+        tokens(&item)
+    };
+    assert_eq!(header(actual_view), header(expected_view));
+    assert_eq!(tokens(actual_marker), tokens(expected_marker));
+    assert_eq!(tokens(actual_fallback), tokens(expected_fallback));
+    assert_eq!(actual_view.items.len(), expected_view.items.len());
+    for (actual, expected) in actual_view.items[..4].iter().zip(&expected_view.items[..4]) {
+        assert_eq!(tokens(actual), tokens(expected));
+    }
+    let syn::TraitItem::Fn(method) = &actual_view.items[4] else {
+        panic!("expected the edited default method");
+    };
+    assert!(method.sig.unsafety.is_some());
+    assert_eq!(tokens(&method.attrs[0]), "# [inline]");
+    assert_eq!(tokens(method.default.as_ref().unwrap()), "{ 19 }");
 }

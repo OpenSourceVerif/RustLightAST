@@ -216,6 +216,7 @@ impl RustCodeGenerator {
             Item::Union(u) => self.generate_union(u), // New
             Item::Function(f) => self.generate_function(f),
             Item::Impl(i) => self.generate_impl(i),
+            Item::Trait(t) => self.generate_trait(t),
             Item::Const(c) => self.generate_const(c),
             Item::TypeAlias(t) => self.generate_type_alias(t),
             Item::Use(u) => self.generate_use(u),
@@ -339,7 +340,8 @@ impl RustCodeGenerator {
     }
 
     fn generate_impl(&mut self, i: &ImplBlock) {
-        self.write("impl");
+        self.generate_attributes(&i.attrs, false);
+        self.write(if i.unsafety { "unsafe impl" } else { "impl" });
 
         self.write(&self.generic_params_to_string(&i.generics.params));
 
@@ -353,21 +355,45 @@ impl RustCodeGenerator {
 
         self.writeln(" {");
         self.indent();
+        self.generate_attributes(&i.attrs, true);
 
         for item in &i.items {
             match item {
                 ImplItem::Method(m) => self.generate_function(m),
-                ImplItem::AssocConst(name, ty, expr) => {
-                    self.writeln(&format!("const {}: {} = ", name, self.type_to_string(ty)));
-                    self.generate_expr(expr);
-                    self.writeln(";");
-                }
-                ImplItem::AssocType(name, ty) => {
-                    self.writeln(&format!("type {} = {};", name, self.type_to_string(ty)));
-                }
+                ImplItem::AssocConst(c) => self.generate_const(c),
+                ImplItem::AssocType(t) => self.generate_type_alias(t),
             }
         }
 
+        self.dedent();
+        self.writeln("}");
+        self.writeln("");
+    }
+
+    fn generate_trait(&mut self, trait_def: &TraitDef) {
+        self.generate_attributes(&trait_def.attrs, false);
+        self.write(&format!(
+            "{}{}{}trait {}{}",
+            self.visibility(&trait_def.vis),
+            if trait_def.unsafety { "unsafe " } else { "" },
+            if trait_def.auto { "auto " } else { "" },
+            trait_def.name,
+            self.generic_params_to_string(&trait_def.generics.params)
+        ));
+        if !trait_def.supertraits.is_empty() {
+            self.write(": ");
+            self.write(&trait_def.supertraits.join(" + "));
+        }
+        self.write_where_predicates(&trait_def.generics.where_predicates);
+        self.writeln(" {");
+        self.indent();
+        self.generate_attributes(&trait_def.attrs, true);
+        for member in &trait_def.members {
+            match member {
+                TraitMember::DefaultMethod(function) => self.generate_function(function),
+                TraitMember::Raw(source) => self.generate_raw(source),
+            }
+        }
         self.dedent();
         self.writeln("}");
         self.writeln("");
@@ -381,10 +407,18 @@ impl RustCodeGenerator {
 
         self.generate_attributes(&f.attrs, false);
 
+        let abi = match &f.qualifiers.abi {
+            Some(FunctionAbi::Default) => "extern ".to_string(),
+            Some(FunctionAbi::Named(name)) => format!("extern {name:?} "),
+            None => String::new(),
+        };
         let head = format!(
-            "{}{}fn {}{}",
+            "{}{}{}{}{}fn {}{}",
             self.visibility(&f.vis),
+            if f.qualifiers.constness { "const " } else { "" },
             if f.asyncness { "async " } else { "" },
+            if f.qualifiers.unsafety { "unsafe " } else { "" },
+            abi,
             f.name,
             self.generic_names_to_string(&f.generics.params)
         );
@@ -445,7 +479,9 @@ impl RustCodeGenerator {
             }
             match generic {
                 GenericParam::Type(parameter) => out.push_str(&parameter.name),
-                GenericParam::Lifetime(_) => out.push_str(&self.generic_param_to_string(generic)),
+                GenericParam::Lifetime(_) | GenericParam::Const { .. } => {
+                    out.push_str(&self.generic_param_to_string(generic));
+                }
             }
         }
         out.push('>');
@@ -453,7 +489,17 @@ impl RustCodeGenerator {
     }
 
     fn generic_param_to_string(&self, generic: &GenericParam) -> String {
-        bounded_name(generic.name(), generic.bounds())
+        match generic {
+            GenericParam::Const { name, ty, default } => {
+                let mut parameter = format!("const {name}: {}", self.type_to_string(ty));
+                if let Some(value) = default {
+                    parameter.push_str(" = ");
+                    parameter.push_str(&Self::new().generate_expression_code(value));
+                }
+                parameter
+            }
+            _ => bounded_name(generic.name(), generic.bounds()),
+        }
     }
 
     fn params_to_string(&self, params: &[Param]) -> String {
@@ -623,10 +669,6 @@ impl RustCodeGenerator {
                 if let Some(trait_path) = &qualification.trait_path {
                     self.write(" as ");
                     self.generate_path(trait_path);
-            // A struct literal exposed before a control-flow body needs grouping.
-            Expr::Record { .. } if position == ExpressionPosition::BeforeBlock => {
-                self.generate_parenthesized(expr);
-            }
                 }
                 self.write(">::");
                 self.generate_path(path);
@@ -635,6 +677,10 @@ impl RustCodeGenerator {
                 self.generate_postfix_base(base, position);
                 self.write(".");
                 self.generate_member(member);
+            }
+            // A struct literal exposed before a control-flow body needs grouping.
+            Expr::Record { .. } if position == ExpressionPosition::BeforeBlock => {
+                self.generate_parenthesized(expr);
             }
             Expr::Record { path, fields, rest } => {
                 self.write(&self.generate_record_path_code(path));
@@ -1217,6 +1263,7 @@ impl RustCodeGenerator {
         for doc in &t.docs {
             self.writeln(doc);
         }
+        self.generate_attributes(&t.attrs, false);
         self.write(&format!(
             "{}type {}{}",
             self.visibility(&t.vis),
@@ -1289,6 +1336,7 @@ impl RustCodeGenerator {
         for doc in &c.docs {
             self.writeln(doc);
         }
+        self.generate_attributes(&c.attrs, false);
         self.write(&format!(
             "{}const {}: {} = ",
             self.visibility(&c.vis),
@@ -1650,6 +1698,7 @@ mod tests {
                     expr: Some(Box::new(expr)),
                 },
                 asyncness: false,
+                qualifiers: Default::default(),
                 vis: Visibility::Public,
                 docs: Vec::new(),
                 attrs: Vec::new(),
@@ -1790,6 +1839,7 @@ mod tests {
             name: "Alias_Test".to_string(),
             docs: Vec::new(),
             items: vec![Item::TypeAlias(TypeAlias {
+                attrs: Vec::new(),
                 name: "Callback".to_string(),
                 target: Type::Generic("Rc".to_string(), vec![Type::Named("T".to_string())]),
                 generics: vec![GenericParam::Type(TypeParameter {
@@ -1824,6 +1874,7 @@ mod tests {
                     expr: None,
                 },
                 asyncness: false,
+                qualifiers: Default::default(),
                 vis: Visibility::Public,
                 docs: Vec::new(),
                 attrs: Vec::new(),
@@ -1853,6 +1904,7 @@ mod tests {
                     expr: None,
                 },
                 asyncness: false,
+                qualifiers: Default::default(),
                 vis: Visibility::Public,
                 docs: Vec::new(),
                 attrs: Vec::new(),

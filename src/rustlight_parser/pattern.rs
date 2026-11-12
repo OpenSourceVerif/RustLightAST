@@ -26,7 +26,7 @@ fn parse_pattern(input: ParseStream<'_>) -> syn::Result<Pattern> {
 /// Convert a parsed Rust binding pattern into RustLightAST.
 pub fn convert_pattern(pattern: &Pat) -> syn::Result<Pattern> {
     match pattern {
-        Pat::Ident(binding) => Ok(Pattern::Ident {
+        Pat::Ident(binding) if binding.attrs.is_empty() => Ok(Pattern::Ident {
             name: binding.ident.to_string(),
             mode: match (binding.by_ref.is_some(), binding.mutability.is_some()) {
                 (false, false) => BindingMode::Value,
@@ -40,37 +40,55 @@ pub fn convert_pattern(pattern: &Pat) -> syn::Result<Pattern> {
                 .map(|(_, subpattern)| convert_pattern(subpattern).map(Box::new))
                 .transpose()?,
         }),
-        Pat::Path(path) => Ok(Pattern::Path(pattern_path(&path.path, &path.qself)?)),
-        Pat::Lit(literal) => Ok(Pattern::Literal(convert_literal(&literal.lit)?)),
-        Pat::Wild(_) => Ok(Pattern::Wildcard),
-        Pat::Rest(_) => Ok(Pattern::Rest),
-        Pat::Tuple(tuple) => Ok(Pattern::Tuple(convert_patterns(&tuple.elems)?)),
-        Pat::TupleStruct(constructor) => Ok(Pattern::TupleStruct {
+        Pat::Path(path) if path.attrs.is_empty() => {
+            Ok(Pattern::Path(pattern_path(&path.path, &path.qself)?))
+        }
+        Pat::Lit(literal) if literal.attrs.is_empty() => {
+            Ok(Pattern::Literal(convert_literal(&literal.lit)?))
+        }
+        Pat::Wild(wildcard) if wildcard.attrs.is_empty() => Ok(Pattern::Wildcard),
+        Pat::Rest(rest) if rest.attrs.is_empty() => Ok(Pattern::Rest),
+        Pat::Tuple(tuple) if tuple.attrs.is_empty() => {
+            Ok(Pattern::Tuple(convert_patterns(&tuple.elems)?))
+        }
+        Pat::TupleStruct(constructor) if constructor.attrs.is_empty() => Ok(Pattern::TupleStruct {
             path: pattern_path(&constructor.path, &constructor.qself)?,
             fields: convert_patterns(&constructor.elems)?,
         }),
-        Pat::Struct(record) => Ok(Pattern::Record {
-            path: pattern_path(&record.path, &record.qself)?,
-            fields: record
-                .fields
-                .iter()
-                .map(convert_pattern_field)
-                .collect::<syn::Result<_>>()?,
-            rest: record.rest.is_some(),
-        }),
-        Pat::Or(alternatives) => Ok(Pattern::Or(convert_patterns(&alternatives.cases)?)),
-        Pat::Slice(slice) => Ok(Pattern::Slice(convert_patterns(&slice.elems)?)),
-        Pat::Type(typed) => Ok(Pattern::Typed {
+        Pat::Struct(record)
+            if record.attrs.is_empty()
+                && record
+                    .rest
+                    .as_ref()
+                    .is_none_or(|rest| rest.attrs.is_empty()) =>
+        {
+            Ok(Pattern::Record {
+                path: pattern_path(&record.path, &record.qself)?,
+                fields: record
+                    .fields
+                    .iter()
+                    .map(convert_pattern_field)
+                    .collect::<syn::Result<_>>()?,
+                rest: record.rest.is_some(),
+            })
+        }
+        Pat::Or(alternatives) if alternatives.attrs.is_empty() => {
+            Ok(Pattern::Or(convert_patterns(&alternatives.cases)?))
+        }
+        Pat::Slice(slice) if slice.attrs.is_empty() => {
+            Ok(Pattern::Slice(convert_patterns(&slice.elems)?))
+        }
+        Pat::Type(typed) if typed.attrs.is_empty() => Ok(Pattern::Typed {
             pattern: Box::new(convert_pattern(&typed.pat)?),
             ty: convert_type(&typed.ty)?,
         }),
-        Pat::Reference(reference) => Ok(Pattern::Reference {
+        Pat::Reference(reference) if reference.attrs.is_empty() => Ok(Pattern::Reference {
             pattern: Box::new(convert_pattern(&reference.pat)?),
             mutable: reference.mutability.is_some(),
         }),
-        Pat::Paren(paren) => Ok(Pattern::Parenthesized(Box::new(convert_pattern(
-            &paren.pat,
-        )?))),
+        Pat::Paren(paren) if paren.attrs.is_empty() => Ok(Pattern::Parenthesized(Box::new(
+            convert_pattern(&paren.pat)?,
+        ))),
         other => Err(ParseError::new_spanned(
             other,
             "unsupported RustLight pattern",

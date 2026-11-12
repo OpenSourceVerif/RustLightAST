@@ -26,6 +26,7 @@ pub enum Item {
     Union(UnionDef),
     Function(FunctionDef),
     Impl(ImplBlock),
+    Trait(TraitDef),
     Const(ConstDef),
     TypeAlias(TypeAlias),
     Use(UseStatement),
@@ -76,14 +77,50 @@ pub struct FunctionDef {
     pub generics: Generics,
     pub body: Block,
     pub asyncness: bool,
+    pub qualifiers: FunctionQualifiers,
     pub vis: Visibility,
     pub docs: Vec<String>,
     pub attrs: Vec<Attribute>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FunctionQualifiers {
+    pub constness: bool,
+    pub unsafety: bool,
+    pub abi: Option<FunctionAbi>,
+}
+
+#[derive(Debug, Clone)]
+pub enum FunctionAbi {
+    Default,
+    Named(String),
+}
+
+/// A trait declaration. Default methods share the function and block model
+/// used by free functions and impl methods.
+#[derive(Debug, Clone)]
+pub struct TraitDef {
+    pub name: String,
+    pub vis: Visibility,
+    pub attrs: Vec<Attribute>,
+    pub generics: Generics,
+    pub supertraits: Vec<String>,
+    pub unsafety: bool,
+    pub auto: bool,
+    pub members: Vec<TraitMember>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TraitMember {
+    DefaultMethod(FunctionDef),
+    Raw(String),
+}
+
 /// Implementation block
 #[derive(Debug, Clone)]
 pub struct ImplBlock {
+    pub unsafety: bool,
+    pub attrs: Vec<Attribute>,
     pub target: Type,
     pub generics: Generics,
     pub items: Vec<ImplItem>,
@@ -93,6 +130,7 @@ pub struct ImplBlock {
 /// Constant definition
 #[derive(Debug, Clone)]
 pub struct ConstDef {
+    pub attrs: Vec<Attribute>,
     pub name: String,
     pub ty: Type,
     pub value: Expr,
@@ -103,6 +141,7 @@ pub struct ConstDef {
 /// Type alias
 #[derive(Debug, Clone)]
 pub struct TypeAlias {
+    pub attrs: Vec<Attribute>,
     pub name: String,
     pub target: Type,
     pub generics: Generics,
@@ -625,6 +664,11 @@ pub enum WherePredicate {
 pub enum GenericParam {
     Type(TypeParameter),
     Lifetime(LifetimeParameter),
+    Const {
+        name: String,
+        ty: Type,
+        default: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -645,6 +689,7 @@ impl GenericParam {
         match self {
             Self::Type(param) => &param.name,
             Self::Lifetime(param) => &param.name,
+            Self::Const { name, .. } => name,
         }
     }
 
@@ -652,20 +697,21 @@ impl GenericParam {
         match self {
             Self::Type(param) => &param.bounds,
             Self::Lifetime(param) => &param.bounds,
+            Self::Const { .. } => &[],
         }
     }
 
     pub fn type_parameter(&self) -> Option<&TypeParameter> {
         match self {
             Self::Type(param) => Some(param),
-            Self::Lifetime(_) => None,
+            Self::Lifetime(_) | Self::Const { .. } => None,
         }
     }
 
     pub fn type_parameter_mut(&mut self) -> Option<&mut TypeParameter> {
         match self {
             Self::Type(param) => Some(param),
-            Self::Lifetime(_) => None,
+            Self::Lifetime(_) | Self::Const { .. } => None,
         }
     }
 }
@@ -687,8 +733,8 @@ impl Param {
 #[derive(Debug, Clone)]
 pub enum ImplItem {
     Method(FunctionDef),
-    AssocConst(String, Type, Expr),
-    AssocType(String, Type),
+    AssocConst(ConstDef),
+    AssocType(TypeAlias),
 }
 
 #[derive(Debug, Clone)]

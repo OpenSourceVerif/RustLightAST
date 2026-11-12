@@ -24,8 +24,8 @@ use syn::{
 use crate::RustCodeGenerator;
 use crate::{
     AssociatedTypeBinding, Attribute, Block, CallableBound, CallableTraitQualifier,
-    CallableTraitType, ClosureParam, ConstDef, EnumDef, Expr, Field, FunctionDef,
-    GenericParam, Generics, ImplBlock, ImplItem, Item, LetStmt,
+    CallableTraitType, ClosureParam, ConstDef, EnumDef, Expr, Field, FunctionAbi, FunctionDef,
+    FunctionQualifiers, GenericParam, Generics, ImplBlock, ImplItem, Item, LetStmt,
     LifetimeParameter, Literal, MatchArm, Member, ModuleDecl, Param, PathType, RecordField,
     RecordPath, RustModule, Statement, StructDef, Type, TypeAlias, TypeParameter, UnionDef,
     UseKind, UseStatement, Variant, Visibility, WherePredicate,
@@ -98,26 +98,17 @@ fn convert_type_fact_item(item: &SynItem) -> Option<Item> {
 
 /// Lower a declaration signature for analyses that do not inspect its body.
 pub fn convert_function_type_fact(item_fn: &syn::ItemFn) -> Option<FunctionDef> {
-    Some(FunctionDef {
-        name: item_fn.sig.ident.to_string(),
-        params: item_fn
-            .sig
-            .inputs
-            .iter()
-            .map(convert_fn_arg)
-            .collect::<syn::Result<Vec<_>>>()
-            .ok()?,
-        return_type: convert_return_type(&item_fn.sig.output).ok()?,
-        generics: convert_generics(&item_fn.sig.generics).ok()?,
-        body: Block {
+    convert_function(
+        &item_fn.sig,
+        Block {
             stmts: Vec::new(),
             expr: None,
         },
-        asyncness: item_fn.sig.asyncness.is_some(),
-        vis: convert_visibility(&item_fn.vis),
-        docs: vec![TYPE_FACT_ONLY_DOC.to_string()],
-        attrs: Vec::new(),
-    })
+        &item_fn.vis,
+        vec![TYPE_FACT_ONLY_DOC.to_string()],
+        Vec::new(),
+    )
+    .ok()
 }
 
 #[cfg(test)]
@@ -219,22 +210,13 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
             attrs: convert_data_attributes(&item_enum.attrs),
             vis: convert_visibility(&item_enum.vis),
         })),
-        SynItem::Fn(item_fn) => Ok(Item::Function(FunctionDef {
-            name: item_fn.sig.ident.to_string(),
-            params: item_fn
-                .sig
-                .inputs
-                .iter()
-                .map(convert_fn_arg)
-                .collect::<syn::Result<Vec<_>>>()?,
-            return_type: convert_return_type(&item_fn.sig.output)?,
-            generics: convert_generics(&item_fn.sig.generics)?,
-            body: convert_block(&item_fn.block)?,
-            asyncness: item_fn.sig.asyncness.is_some(),
-            vis: convert_visibility(&item_fn.vis),
-            docs: Vec::new(),
-            attrs: convert_attributes(&item_fn.attrs),
-        })),
+        SynItem::Fn(item_fn) => Ok(Item::Function(convert_function(
+            &item_fn.sig,
+            convert_block(&item_fn.block)?,
+            &item_fn.vis,
+            Vec::new(),
+            convert_attributes(&item_fn.attrs),
+        )?)),
         SynItem::Struct(item_struct) => Ok(Item::Struct(StructDef {
             name: item_struct.ident.to_string(),
             fields: convert_fields(&item_struct.fields)?,
@@ -261,14 +243,16 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
             target: convert_type(&item_type.ty)?,
             generics: convert_generics(&item_type.generics)?,
             vis: convert_visibility(&item_type.vis),
-            docs: extract_docs(&item_type.attrs),
+            docs: Vec::new(),
+            attrs: convert_attributes(&item_type.attrs),
         })),
         SynItem::Const(item_const) => Ok(Item::Const(ConstDef {
             name: item_const.ident.to_string(),
             ty: convert_type(&item_const.ty)?,
             value: convert_expr(&item_const.expr)?,
             vis: convert_visibility(&item_const.vis),
-            docs: extract_docs(&item_const.attrs),
+            docs: Vec::new(),
+            attrs: convert_attributes(&item_const.attrs),
         })),
         SynItem::Use(item_use) => Ok(Item::Use(convert_use(item_use))),
         SynItem::Impl(item_impl) => {
@@ -298,7 +282,7 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 nested_items,
             ))))
         }
-        SynItem::Trait(item_trait) => Ok(Item::Raw(normalize_tokens(item_trait.to_token_stream()))),
+        SynItem::Trait(item_trait) => Ok(convert_trait(item_trait)),
         SynItem::Macro(item_macro) => Ok(Item::Raw(normalize_tokens(item_macro.to_token_stream()))),
         other => Err(syn::Error::new_spanned(
             other,
@@ -341,24 +325,111 @@ fn convert_field(field: &syn::Field) -> syn::Result<Field> {
             .unwrap_or_default(),
         ty: convert_type(&field.ty)?,
         vis: convert_visibility(&field.vis),
-        docs: extract_docs(&field.attrs),
+        docs: Vec::new(),
         attrs: convert_attributes(&field.attrs),
+    })
+}
+
+fn convert_trait(item: &syn::ItemTrait) -> Item {
+    // DEFENSE: a restricted trait or an unsupported where clause must
+    // retain its original interface when the header cannot be modeled.
+    if item.restriction.is_some() {
+        return Item::Raw(item.to_token_stream().to_string());
+    }
+    let Ok(generics) = convert_generics(&item.generics) else {
+        return Item::Raw(item.to_token_stream().to_string());
+    };
+    Item::Trait(crate::TraitDef {
+        name: item.ident.to_string(),
+        vis: convert_visibility(&item.vis),
+        attrs: convert_attributes(&item.attrs),
+        generics,
+        supertraits: item
+            .supertraits
+            .iter()
+            .map(|bound| bound.to_token_stream().to_string())
+            .collect(),
+        unsafety: item.unsafety.is_some(),
+        auto: item.auto_token.is_some(),
+        members: item.items.iter().map(convert_trait_member).collect(),
+    })
+}
+
+fn convert_trait_member(member: &syn::TraitItem) -> crate::TraitMember {
+    if let syn::TraitItem::Fn(method) = member {
+        if let Some(default) = &method.default {
+            let converted = convert_block(default).and_then(|body| {
+                convert_function(
+                    &method.sig,
+                    body,
+                    &syn::Visibility::Inherited,
+                    Vec::new(),
+                    convert_attributes(&method.attrs),
+                )
+            });
+            if let Ok(function) = converted {
+                return crate::TraitMember::DefaultMethod(function);
+            }
+        }
+    }
+    crate::TraitMember::Raw(member.to_token_stream().to_string())
+}
+
+fn convert_function(
+    signature: &syn::Signature,
+    body: Block,
+    visibility: &syn::Visibility,
+    docs: Vec<String>,
+    attrs: Vec<Attribute>,
+) -> syn::Result<FunctionDef> {
+    if let Some(variadic) = &signature.variadic {
+        return Err(syn::Error::new_spanned(
+            variadic,
+            "unsupported variadic parameter",
+        ));
+    }
+    Ok(FunctionDef {
+        name: signature.ident.to_string(),
+        params: signature
+            .inputs
+            .iter()
+            .map(convert_fn_arg)
+            .collect::<syn::Result<_>>()?,
+        return_type: convert_return_type(&signature.output)?,
+        generics: convert_generics(&signature.generics)?,
+        body,
+        asyncness: signature.asyncness.is_some(),
+        qualifiers: FunctionQualifiers {
+            constness: signature.constness.is_some(),
+            unsafety: signature.unsafety.is_some(),
+            abi: signature.abi.as_ref().map(|abi| match &abi.name {
+                Some(name) => FunctionAbi::Named(name.value()),
+                None => FunctionAbi::Default,
+            }),
+        },
+        vis: convert_visibility(visibility),
+        docs,
+        attrs,
     })
 }
 
 fn convert_fn_arg(arg: &syn::FnArg) -> syn::Result<Param> {
     match arg {
-        syn::FnArg::Receiver(receiver) => Ok(Param {
+        syn::FnArg::Receiver(receiver) if receiver.attrs.is_empty() => Ok(Param {
             name: "self".to_string(),
             ty: convert_type(&receiver.ty)?,
             mutable: receiver.reference.is_none() && receiver.mutability.is_some(),
         }),
-        syn::FnArg::Typed(parameter) => {
+        syn::FnArg::Typed(parameter) if parameter.attrs.is_empty() => {
             let (name, mutable) = match parameter.pat.as_ref() {
-                Pat::Ident(binding) if binding.by_ref.is_none() && binding.subpat.is_none() => {
+                Pat::Ident(binding)
+                    if binding.attrs.is_empty()
+                        && binding.by_ref.is_none()
+                        && binding.subpat.is_none() =>
+                {
                     (binding.ident.to_string(), binding.mutability.is_some())
                 }
-                Pat::Wild(_) => ("_".to_string(), false),
+                Pat::Wild(wildcard) if wildcard.attrs.is_empty() => ("_".to_string(), false),
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
@@ -372,12 +443,26 @@ fn convert_fn_arg(arg: &syn::FnArg) -> syn::Result<Param> {
                 mutable,
             })
         }
+        _ => Err(syn::Error::new_spanned(
+            arg,
+            "unsupported attributes on function parameter",
+        )),
     }
 }
 
 /// Convert the type and generic parameters of an impl without its items.
 pub fn convert_impl_header(item: &syn::ItemImpl) -> syn::Result<ImplBlock> {
+    if item.defaultness.is_some()
+        || item
+            .trait_
+            .as_ref()
+            .is_some_and(|(negation, _, _)| negation.is_some())
+    {
+        return Err(syn::Error::new_spanned(item, "unsupported impl modifier"));
+    }
     Ok(ImplBlock {
+        unsafety: item.unsafety.is_some(),
+        attrs: convert_attributes(&item.attrs),
         target: convert_type(&item.self_ty)?,
         generics: convert_generics(&item.generics)?,
         items: Vec::new(),
@@ -391,31 +476,39 @@ pub fn convert_impl_header(item: &syn::ItemImpl) -> syn::Result<ImplBlock> {
 
 fn convert_impl_item(item: &SynImplItem) -> syn::Result<ImplItem> {
     match item {
-        SynImplItem::Fn(method) => Ok(ImplItem::Method(FunctionDef {
-            name: method.sig.ident.to_string(),
-            params: method
-                .sig
-                .inputs
-                .iter()
-                .map(convert_fn_arg)
-                .collect::<syn::Result<Vec<_>>>()?,
-            return_type: convert_return_type(&method.sig.output)?,
-            generics: convert_generics(&method.sig.generics)?,
-            body: convert_block(&method.block)?,
-            asyncness: method.sig.asyncness.is_some(),
-            vis: convert_visibility(&method.vis),
-            docs: Vec::new(),
-            attrs: convert_attributes(&method.attrs),
-        })),
-        SynImplItem::Const(item_const) => Ok(ImplItem::AssocConst(
-            item_const.ident.to_string(),
-            convert_type(&item_const.ty)?,
-            convert_expr(&item_const.expr)?,
-        )),
-        SynImplItem::Type(item_type) => Ok(ImplItem::AssocType(
-            item_type.ident.to_string(),
-            convert_type(&item_type.ty)?,
-        )),
+        SynImplItem::Fn(method) if method.defaultness.is_none() => {
+            Ok(ImplItem::Method(convert_function(
+                &method.sig,
+                convert_block(&method.block)?,
+                &method.vis,
+                Vec::new(),
+                convert_attributes(&method.attrs),
+            )?))
+        }
+        SynImplItem::Const(item_const)
+            if item_const.defaultness.is_none()
+                && item_const.generics.params.is_empty()
+                && item_const.generics.where_clause.is_none() =>
+        {
+            Ok(ImplItem::AssocConst(ConstDef {
+                name: item_const.ident.to_string(),
+                ty: convert_type(&item_const.ty)?,
+                value: convert_expr(&item_const.expr)?,
+                vis: convert_visibility(&item_const.vis),
+                docs: Vec::new(),
+                attrs: convert_attributes(&item_const.attrs),
+            }))
+        }
+        SynImplItem::Type(item_type) if item_type.defaultness.is_none() => {
+            Ok(ImplItem::AssocType(TypeAlias {
+                name: item_type.ident.to_string(),
+                target: convert_type(&item_type.ty)?,
+                generics: convert_generics(&item_type.generics)?,
+                vis: convert_visibility(&item_type.vis),
+                docs: Vec::new(),
+                attrs: convert_attributes(&item_type.attrs),
+            }))
+        }
         other => Err(syn::Error::new_spanned(
             other,
             "unsupported impl item kind in RustLightAST parser",
@@ -823,72 +916,10 @@ pub fn convert_block(block: &syn::Block) -> syn::Result<Block> {
 }
 
 fn convert_local_item(item: &SynItem) -> Item {
-    if let SynItem::Fn(function) = item {
-        if can_model_local_function(function) {
-            if let Ok(function) = convert_item(item) {
-                return function;
-            }
-        }
+    match item {
+        SynItem::Fn(_) => convert_item_preserving(item),
+        _ => Item::Raw(normalize_tokens(item.to_token_stream())),
     }
-    Item::Raw(normalize_tokens(item.to_token_stream()))
-}
-
-fn can_model_local_function(function: &syn::ItemFn) -> bool {
-    use syn::visit::{self, Visit};
-
-    // DEFENSE: unlike module declarations, local functions have no metadata
-    // restoration after printing. Keep their original syntax when a supported
-    // conversion would still erase qualifiers, attributes, or arguments.
-    struct Complete(bool);
-    impl<'ast> Visit<'ast> for Complete {
-        fn visit_item(&mut self, _: &'ast SynItem) {
-            // Nested items make their own conversion decision.
-        }
-
-        fn visit_attribute(&mut self, _: &'ast syn::Attribute) {
-            self.0 = false;
-        }
-
-        fn visit_generic_param(&mut self, parameter: &'ast syn::GenericParam) {
-            self.0 &= match parameter {
-                syn::GenericParam::Type(parameter) => parameter.default.is_none(),
-                syn::GenericParam::Lifetime(_) => true,
-                syn::GenericParam::Const(_) => false,
-            };
-            visit::visit_generic_param(self, parameter);
-        }
-
-        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            self.0 &= call.turbofish.is_none();
-            visit::visit_expr_method_call(self, call);
-        }
-
-        fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
-            self.0 &= closure.asyncness.is_none()
-                && closure.constness.is_none()
-                && closure.movability.is_none()
-                && closure.lifetimes.is_none();
-            visit::visit_expr_closure(self, closure);
-        }
-
-        fn visit_local(&mut self, local: &'ast syn::Local) {
-            self.0 &= !matches!(&local.pat, Pat::Ident(pattern) if pattern.by_ref.is_some());
-            self.visit_pat(&local.pat);
-            if let Some(init) = &local.init {
-                self.visit_local_init(init);
-            }
-        }
-    }
-
-    let signature = &function.sig;
-    let mut complete = Complete(
-        signature.constness.is_none()
-            && signature.unsafety.is_none()
-            && signature.abi.is_none()
-            && signature.variadic.is_none(),
-    );
-    complete.visit_item_fn(function);
-    complete.0
 }
 
 fn convert_local(local: &syn::Local) -> syn::Result<Statement> {
@@ -912,18 +943,19 @@ fn convert_local(local: &syn::Local) -> syn::Result<Statement> {
     }
 
     let (name, ifmut, ty) = match &local.pat {
-        Pat::Type(typed) => (
+        Pat::Type(typed) if typed.attrs.is_empty() => (
             typed.pat.to_token_stream().to_string(),
             false,
             Some(convert_type(&typed.ty)?),
         ),
         Pat::Ident(PatIdent {
+            attrs,
             ident,
             by_ref: None,
             mutability,
             subpat: None,
             ..
-        }) => (ident.to_string(), mutability.is_some(), None),
+        }) if attrs.is_empty() => (ident.to_string(), mutability.is_some(), None),
         pat => (pat.to_token_stream().to_string(), false, None),
     };
 
@@ -944,20 +976,23 @@ fn convert_local(local: &syn::Local) -> syn::Result<Statement> {
 /// Convert a parsed Rust expression without reparsing its source.
 pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
     match expr {
-        syn::Expr::Path(expr_path) => convert_expr_path(expr_path),
-        syn::Expr::Call(ExprCall { func, args, .. }) => Ok(Expr::Call(
+        syn::Expr::Path(expr_path) if expr_path.attrs.is_empty() => convert_expr_path(expr_path),
+        syn::Expr::Call(ExprCall {
+            attrs, func, args, ..
+        }) if attrs.is_empty() => Ok(Expr::Call(
             Box::new(convert_expr(func)?),
             args.iter()
                 .map(convert_expr)
                 .collect::<syn::Result<Vec<_>>>()?,
         )),
         syn::Expr::MethodCall(ExprMethodCall {
+            attrs,
             receiver,
             method,
             turbofish,
             args,
             ..
-        }) => {
+        }) if attrs.is_empty() => {
             let method = turbofish.as_ref().map_or_else(
                 || method.to_string(),
                 |arguments| format!("{method}{}", normalize_tokens(arguments.to_token_stream())),
@@ -970,14 +1005,21 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                     .collect::<syn::Result<Vec<_>>>()?,
             ))
         }
-        syn::Expr::Match(ExprMatch { expr, arms, .. }) => Ok(Expr::Match {
+        syn::Expr::Match(ExprMatch {
+            attrs, expr, arms, ..
+        }) if attrs.is_empty() => Ok(Expr::Match {
             expr: Box::new(convert_expr(expr)?),
             arms: arms
                 .iter()
                 .map(convert_match_arm)
                 .collect::<syn::Result<Vec<_>>>()?,
         }),
-        syn::Expr::Block(ExprBlock { label, block, .. }) => {
+        syn::Expr::Block(ExprBlock {
+            attrs,
+            label,
+            block,
+            ..
+        }) if attrs.is_empty() => {
             let body = convert_block(block)?;
             Ok(match label {
                 Some(label) => Expr::LabeledBlock {
@@ -987,15 +1029,15 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 None => Expr::Block(body),
             })
         }
-        syn::Expr::Loop(expr) => Ok(Expr::Loop(
+        syn::Expr::Loop(expr) if expr.attrs.is_empty() => Ok(Expr::Loop(
             Box::new(convert_block(&expr.body)?),
             expr.label
                 .as_ref()
                 .map(|label| label.name.ident.to_string()),
         )),
-        syn::Expr::While(expr) => {
+        syn::Expr::While(expr) if expr.attrs.is_empty() => {
             let condition = match expr.cond.as_ref() {
-                syn::Expr::Let(condition) => Expr::Let {
+                syn::Expr::Let(condition) if condition.attrs.is_empty() => Expr::Let {
                     pattern: pattern::convert_pattern(&condition.pat)?,
                     value: Box::new(convert_expr(&condition.expr)?),
                 },
@@ -1010,7 +1052,7 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 body: convert_block(&expr.body)?,
             })
         }
-        syn::Expr::ForLoop(expr) => Ok(Expr::For {
+        syn::Expr::ForLoop(expr) if expr.attrs.is_empty() => Ok(Expr::For {
             label: expr
                 .label
                 .as_ref()
@@ -1019,14 +1061,14 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
             iter: Box::new(convert_expr(&expr.expr)?),
             body: convert_block(&expr.body)?,
         }),
-        syn::Expr::Return(expr) => Ok(Expr::Return(
+        syn::Expr::Return(expr) if expr.attrs.is_empty() => Ok(Expr::Return(
             expr.expr
                 .as_deref()
                 .map(convert_expr)
                 .transpose()?
                 .map(Box::new),
         )),
-        syn::Expr::Break(expr) => Ok(Expr::Break {
+        syn::Expr::Break(expr) if expr.attrs.is_empty() => Ok(Expr::Break {
             label: expr.label.as_ref().map(|label| label.ident.to_string()),
             value: expr
                 .expr
@@ -1035,19 +1077,22 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 .transpose()?
                 .map(Box::new),
         }),
-        syn::Expr::Continue(expr) => Ok(Expr::Continue(
+        syn::Expr::Continue(expr) if expr.attrs.is_empty() => Ok(Expr::Continue(
             expr.label.as_ref().map(|label| label.ident.to_string()),
         )),
         syn::Expr::Reference(ExprReference {
-            expr, mutability, ..
-        }) => Ok(Expr::Reference(
+            attrs,
+            expr,
+            mutability,
+            ..
+        }) if attrs.is_empty() => Ok(Expr::Reference(
             Box::new(convert_expr(expr)?),
             true,
             mutability.is_some(),
         )),
-        syn::Expr::Cast(ExprCast { expr, ty, .. }) => {
-            Ok(Expr::Cast(Box::new(convert_expr(expr)?), convert_type(ty)?))
-        }
+        syn::Expr::Cast(ExprCast {
+            attrs, expr, ty, ..
+        }) if attrs.is_empty() => Ok(Expr::Cast(Box::new(convert_expr(expr)?), convert_type(ty)?)),
         syn::Expr::Async(expr) => {
             if !expr.attrs.is_empty() {
                 return Err(syn::Error::new_spanned(
@@ -1060,12 +1105,14 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 move_capture: expr.capture.is_some(),
             })
         }
-        syn::Expr::Try(expr) => Ok(Expr::Try(Box::new(convert_expr(&expr.expr)?))),
-        syn::Expr::Repeat(expr) => Ok(Expr::Repeat {
+        syn::Expr::Try(expr) if expr.attrs.is_empty() => {
+            Ok(Expr::Try(Box::new(convert_expr(&expr.expr)?)))
+        }
+        syn::Expr::Repeat(expr) if expr.attrs.is_empty() => Ok(Expr::Repeat {
             value: Box::new(convert_expr(&expr.expr)?),
             len: Box::new(convert_expr(&expr.len)?),
         }),
-        syn::Expr::Range(expr) => {
+        syn::Expr::Range(expr) if expr.attrs.is_empty() => {
             let bound = |bound: Option<&syn::Expr>| {
                 bound
                     .map(|bound| convert_expr(bound).map(Box::new))
@@ -1083,37 +1130,49 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
             };
             Ok(Expr::Range { start, end })
         }
-        syn::Expr::Paren(ExprParen { expr, .. }) | syn::Expr::Group(ExprGroup { expr, .. }) => {
+        syn::Expr::Paren(ExprParen { attrs, expr, .. })
+        | syn::Expr::Group(ExprGroup { attrs, expr, .. })
+            if attrs.is_empty() =>
+        {
             Ok(Expr::Parenthesized(Box::new(convert_expr(expr)?)))
         }
         syn::Expr::Binary(ExprBinary {
-            left, op, right, ..
-        }) => Ok(Expr::BinaryOp(
+            attrs,
+            left,
+            op,
+            right,
+            ..
+        }) if attrs.is_empty() => Ok(Expr::BinaryOp(
             Box::new(convert_expr(left)?),
             op.to_token_stream().to_string(),
             Box::new(convert_expr(right)?),
         )),
-        syn::Expr::Unary(ExprUnary { op, expr, .. }) => Ok(Expr::UnaryOp(
+        syn::Expr::Unary(ExprUnary {
+            attrs, op, expr, ..
+        }) if attrs.is_empty() => Ok(Expr::UnaryOp(
             op.to_token_stream().to_string(),
             Box::new(convert_expr(expr)?),
         )),
-        syn::Expr::Assign(ExprAssign { left, right, .. }) => Ok(Expr::Assign(
+        syn::Expr::Assign(ExprAssign {
+            attrs, left, right, ..
+        }) if attrs.is_empty() => Ok(Expr::Assign(
             Box::new(convert_expr(left)?),
             Box::new(convert_expr(right)?),
         )),
         syn::Expr::If(ExprIf {
+            attrs,
             cond,
             then_branch,
             else_branch,
             ..
-        }) => {
+        }) if attrs.is_empty() => {
             let then_branch = convert_block(then_branch)?;
             let else_branch = else_branch
                 .as_ref()
                 .map(|(_, expr)| expr_to_block(expr))
                 .transpose()?;
             match cond.as_ref() {
-                syn::Expr::Let(condition) => Ok(Expr::IfLet {
+                syn::Expr::Let(condition) if condition.attrs.is_empty() => Ok(Expr::IfLet {
                     pattern: normalize_tokens(condition.pat.to_token_stream()),
                     value: Box::new(convert_expr(&condition.expr)?),
                     then_branch,
@@ -1126,22 +1185,31 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 }),
             }
         }
-        syn::Expr::Lit(ExprLit { lit, .. }) => Ok(Expr::Literal(convert_literal(lit)?)),
-        syn::Expr::Tuple(ExprTuple { elems, .. }) => Ok(Expr::Tuple(
+        syn::Expr::Lit(ExprLit { attrs, lit, .. }) if attrs.is_empty() => {
+            Ok(Expr::Literal(convert_literal(lit)?))
+        }
+        syn::Expr::Tuple(ExprTuple { attrs, elems, .. }) if attrs.is_empty() => Ok(Expr::Tuple(
             elems
                 .iter()
                 .map(convert_expr)
                 .collect::<syn::Result<Vec<_>>>()?,
         )),
-        syn::Expr::Index(ExprIndex { expr, index, .. }) => Ok(Expr::Index(
+        syn::Expr::Index(ExprIndex {
+            attrs, expr, index, ..
+        }) if attrs.is_empty() => Ok(Expr::Index(
             Box::new(convert_expr(expr)?),
             Box::new(convert_expr(index)?),
         )),
-        syn::Expr::Field(ExprField { base, member, .. }) => Ok(Expr::Field {
+        syn::Expr::Field(ExprField {
+            attrs,
+            base,
+            member,
+            ..
+        }) if attrs.is_empty() => Ok(Expr::Field {
             base: Box::new(convert_expr(base)?),
             member: convert_member(member),
         }),
-        syn::Expr::Struct(record) => {
+        syn::Expr::Struct(record) if record.attrs.is_empty() => {
             if record.qself.is_some() {
                 return Err(syn::Error::new_spanned(
                     record,
@@ -1163,7 +1231,7 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                     .map(Box::new),
             })
         }
-        syn::Expr::Array(ExprArray { elems, .. }) => Ok(Expr::Array(
+        syn::Expr::Array(ExprArray { attrs, elems, .. }) if attrs.is_empty() => Ok(Expr::Array(
             elems
                 .iter()
                 .map(convert_expr)
@@ -1176,12 +1244,17 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
             Ok(Expr::Macro(source))
         }
         syn::Expr::Closure(ExprClosure {
+            attrs,
             capture,
+            asyncness: None,
+            constness: None,
+            lifetimes: None,
+            movability: None,
             inputs,
             output,
             body,
             ..
-        }) => {
+        }) if attrs.is_empty() => {
             let is_move = capture.is_some();
             let params = inputs
                 .iter()
@@ -1216,7 +1289,12 @@ fn convert_closure_param(pattern: &syn::Pat) -> syn::Result<ClosureParam> {
 
 fn expr_to_block(expr: &syn::Expr) -> syn::Result<Block> {
     match expr {
-        syn::Expr::Block(ExprBlock { label: None, block, .. }) => convert_block(block),
+        syn::Expr::Block(ExprBlock {
+            attrs,
+            label: None,
+            block,
+            ..
+        }) if attrs.is_empty() => convert_block(block),
         syn::Expr::If(expr_if) => Ok(Block {
             stmts: Vec::new(),
             expr: Some(Box::new(convert_expr(&syn::Expr::If(expr_if.clone()))?)),
@@ -1229,6 +1307,12 @@ fn expr_to_block(expr: &syn::Expr) -> syn::Result<Block> {
 }
 
 fn convert_match_arm(arm: &syn::Arm) -> syn::Result<MatchArm> {
+    if let Some(attr) = arm.attrs.first() {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "unsupported attributes on match arm",
+        ));
+    }
     Ok(MatchArm {
         pattern: pattern::convert_pattern(&arm.pat)?,
         guard: arm
@@ -1405,21 +1489,33 @@ fn convert_generics(generics: &syn::Generics) -> syn::Result<Generics> {
     let mut params = generics
         .params
         .iter()
-        .filter_map(|param| match param {
-            syn::GenericParam::Type(type_param) => Some(GenericParam::Type(TypeParameter {
-                name: type_param.ident.to_string(),
-                bounds: type_param
-                    .bounds
-                    .iter()
-                    .map(|bound| normalize_tokens(bound.to_token_stream()))
-                    .collect(),
-            })),
-            syn::GenericParam::Lifetime(param) => {
-                Some(GenericParam::Lifetime(convert_lifetime_param(param)))
+        .map(|param| match param {
+            syn::GenericParam::Type(type_param)
+                if type_param.attrs.is_empty() && type_param.default.is_none() =>
+            {
+                Ok(GenericParam::Type(TypeParameter {
+                    name: type_param.ident.to_string(),
+                    bounds: type_param
+                        .bounds
+                        .iter()
+                        .map(|bound| normalize_tokens(bound.to_token_stream()))
+                        .collect(),
+                }))
             }
-            _ => None,
+            syn::GenericParam::Lifetime(param) if param.attrs.is_empty() => {
+                Ok(GenericParam::Lifetime(convert_lifetime_param(param)))
+            }
+            syn::GenericParam::Const(param) if param.attrs.is_empty() => Ok(GenericParam::Const {
+                name: param.ident.to_string(),
+                ty: convert_type(&param.ty)?,
+                default: param.default.as_ref().map(convert_expr).transpose()?,
+            }),
+            _ => Err(syn::Error::new_spanned(
+                param,
+                "unsupported generic parameter in RustLightAST parser",
+            )),
         })
-        .collect::<Vec<_>>();
+        .collect::<syn::Result<Vec<_>>>()?;
     let mut where_predicates = Vec::new();
 
     if let Some(clause) = &generics.where_clause {
@@ -1948,7 +2044,7 @@ pub fn values() -> (usize, usize) {
     }
 
     #[test]
-    fn preserves_trait_items_and_renamed_uses_as_raw_rust() {
+    fn preserves_required_trait_methods_and_renamed_uses() {
         let source = r#"
 use num_traits::sign::Signed as _;
 
