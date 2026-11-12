@@ -68,13 +68,20 @@ impl RustCodeGenerator {
             Item::TypeAlias(t) => self.generate_type_alias(t),
             Item::Use(u) => self.generate_use(u),
             Item::Mod(m) => self.generate_nested_module(m),
+            Item::ModuleDecl(module) => {
+                for attr in &module.attrs {
+                    self.writeln(attr);
+                }
+                self.writeln(&format!("{}mod {};", self.visibility(&module.vis), module.name));
+            }
             Item::LazyStatic(l) => self.generate_lazy_static(l),
         }
     }
 
     fn generate_raw(&mut self, raw: &str) {
-        for line in raw.lines() {
-            self.writeln(line);
+        if !raw.is_empty() {
+            // Reindenting the contents would change multiline string literals.
+            self.writeln(raw.strip_suffix('\n').unwrap_or(raw));
         }
     }
 
@@ -379,6 +386,9 @@ impl RustCodeGenerator {
     fn generate_statement(&mut self, stmt: &Statement) {
         match stmt {
             Statement::Let(ls) => {
+                for attr in &ls.attrs {
+                    self.writeln(attr);
+                }
                 self.write(&format!(
                     "{} {}",
                     if ls.ifmut { "let mut" } else { "let" },
@@ -393,9 +403,44 @@ impl RustCodeGenerator {
                 }
                 self.writeln(";");
             }
+            Statement::LetElse {
+                attrs,
+                pattern,
+                value,
+                else_block,
+            } => {
+                for attr in attrs {
+                    self.writeln(attr);
+                }
+                self.write("let ");
+                self.generate_pattern(pattern);
+                self.write(" = ");
+                self.generate_expr(value);
+                self.writeln(" else {");
+                self.indent();
+                self.generate_block(else_block);
+                self.dedent();
+                self.writeln("};");
+            }
             Statement::Expr(expr) => {
                 self.generate_expr(expr);
                 self.writeln(";");
+            }
+            Statement::Macro(statement) => {
+                for attr in &statement.attrs {
+                    self.writeln(attr);
+                }
+                let (open, close) = match statement.delimiter {
+                    crate::MacroDelimiter::Parenthesis => ("(", ")"),
+                    crate::MacroDelimiter::Brace => ("{", "}"),
+                    crate::MacroDelimiter::Bracket => ("[", "]"),
+                };
+                self.write(&statement.path);
+                self.write("!");
+                self.write(open);
+                self.write(&statement.tokens);
+                self.write(close);
+                self.writeln(if statement.semicolon { ";" } else { "" });
             }
             Statement::Item(item) => self.generate_item(item),
             Statement::Comment(comment) => {
@@ -531,7 +576,11 @@ impl RustCodeGenerator {
                 self.dedent();
                 self.write("}");
             }
-            Expr::For { pattern, iter, body } => {
+            Expr::For {
+                pattern,
+                iter,
+                body,
+            } => {
                 self.write("for ");
                 self.generate_pattern(pattern);
                 self.write(" in ");
@@ -974,30 +1023,22 @@ impl RustCodeGenerator {
         self.writeln("");
     }
 
-    fn generate_use(&mut self, u: &UseStatement) {
-        self.write("use ");
-
-        // Generate the path part (e.g., \"super\" or \"std::collections\")
-        for (i, part) in u.path.iter().enumerate() {
-            if i > 0 {
-                self.write("::");
-            }
-            self.write(part);
+    fn generate_use(&mut self, import: &UseStatement) {
+        for attr in &import.attrs {
+            self.writeln(attr);
         }
-
-        // Generate different kinds of use statements
-        match &u.kind {
+        self.write(&self.visibility(&import.vis));
+        self.write("use ");
+        if import.absolute {
+            self.write("::");
+        }
+        self.write(&import.path.join("::"));
+        let separator = if import.path.is_empty() { "" } else { "::" };
+        match &import.kind {
             UseKind::Simple => self.writeln(";"),
-            UseKind::Glob => self.writeln("::*;"),
+            UseKind::Glob => self.writeln(&format!("{separator}*;")),
             UseKind::Nested(items) => {
-                self.write("::{");
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.write(item);
-                }
-                self.writeln("};");
+                self.writeln(&format!("{separator}{{{}}};", items.join(", ")));
             }
         }
     }

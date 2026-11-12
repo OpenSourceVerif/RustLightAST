@@ -27,6 +27,7 @@ pub enum Item {
     TypeAlias(TypeAlias),
     Use(UseStatement),
     Mod(Box<RustModule>),      // nested module
+    ModuleDecl(ModuleDecl),   // out-of-line module
     LazyStatic(LazyStaticDef), // lazy_static! macro
 }
 
@@ -365,14 +366,39 @@ pub struct Block {
 #[derive(Debug, Clone)]
 pub enum Statement {
     Let(LetStmt),
+    LetElse {
+        attrs: Vec<String>,
+        pattern: Pattern,
+        value: Box<Expr>,
+        else_block: Block,
+    },
     Expr(Expr),
+    Macro(MacroStmt),
     Item(Box<Item>),
     Comment(String), // comment statement
+}
+
+/// A statement-position macro invocation whose input remains opaque Rust tokens.
+#[derive(Debug, Clone)]
+pub struct MacroStmt {
+    pub attrs: Vec<String>,
+    pub path: String,
+    pub delimiter: MacroDelimiter,
+    pub tokens: String,
+    pub semicolon: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroDelimiter {
+    Parenthesis,
+    Brace,
+    Bracket,
 }
 
 /// let binding
 #[derive(Debug, Clone)]
 pub struct LetStmt {
+    pub attrs: Vec<String>,
     pub ifmut: bool,
     pub name: String,
     pub ty: Option<Type>,
@@ -475,6 +501,12 @@ pub struct Param {
     pub mutable: bool,
 }
 
+impl Param {
+    pub fn binding_name(&self) -> Option<&str> {
+        (!self.name.is_empty() && self.name != "_").then_some(self.name.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ImplItem {
     Method(FunctionDef),
@@ -483,9 +515,21 @@ pub enum ImplItem {
 }
 
 #[derive(Debug, Clone)]
+pub struct ModuleDecl {
+    pub name: String,
+    pub vis: Visibility,
+    /// Outer attributes in declaration order, including doc attributes.
+    pub attrs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct UseStatement {
     pub path: Vec<String>,
     pub kind: UseKind,
+    pub absolute: bool,
+    pub vis: Visibility,
+    /// Outer attributes in declaration order, including doc attributes.
+    pub attrs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -25,7 +25,8 @@ use crate::RustCodeGenerator;
 use crate::{
     Attribute, AttributeArg, Block, CallableBound, CallableTraitQualifier, CallableTraitType, ClosureParam,
     ConstDef, EnumDef, Expr, Field, FunctionDef, GenericParam, ImplBlock, ImplItem, Item, LetStmt,
-    LifetimeParameter, Literal, MatchArm, Member, Param, PathType, RecordField, RustModule,
+    LifetimeParameter, Literal, MatchArm, Member, ModuleDecl, Param, PathType, RecordField,
+    RustModule,
     Statement, StructDef, Type, TypeAlias, TypeParameter, UnionDef, UseKind, UseStatement, Variant,
     Visibility,
 };
@@ -224,7 +225,7 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
             vis: convert_visibility(&item_const.vis),
             docs: extract_docs(&item_const.attrs),
         })),
-        SynItem::Use(item_use) => Ok(Item::Use(convert_use_tree(&item_use.tree))),
+        SynItem::Use(item_use) => Ok(Item::Use(convert_use(item_use))),
         SynItem::Impl(item_impl) => {
             let mut block = convert_impl_header(item_impl)?;
             block.items = item_impl
@@ -234,11 +235,13 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .collect::<syn::Result<Vec<_>>>()?;
             Ok(Item::Impl(block))
         }
-        SynItem::Mod(item_mod) if item_mod.content.is_none() => Ok(Item::Raw(format!(
-            "{}mod {};",
-            visibility_to_source(&convert_visibility(&item_mod.vis)),
-            item_mod.ident
-        ))),
+        SynItem::Mod(item_mod) if item_mod.content.is_none() => {
+            Ok(Item::ModuleDecl(ModuleDecl {
+                name: item_mod.ident.to_string(),
+                vis: convert_visibility(&item_mod.vis),
+                attrs: item_mod.attrs.iter().map(attribute_to_raw_source).collect(),
+            }))
+        }
         SynItem::Mod(item_mod) => {
             let nested_items = item_mod
                 .content
@@ -312,24 +315,22 @@ fn convert_fn_arg(arg: &syn::FnArg) -> syn::Result<Param> {
             mutable: receiver.reference.is_none() && receiver.mutability.is_some(),
         }),
         syn::FnArg::Typed(parameter) => {
-            let Pat::Ident(binding) = parameter.pat.as_ref() else {
-                return Err(syn::Error::new_spanned(
-                    &parameter.pat,
-                    "unsupported parameter pattern in RustLightAST parser",
-                ));
+            let (name, mutable) = match parameter.pat.as_ref() {
+                Pat::Ident(binding) if binding.by_ref.is_none() && binding.subpat.is_none() => {
+                    (binding.ident.to_string(), binding.mutability.is_some())
+                }
+                Pat::Wild(_) => ("_".to_string(), false),
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        other,
+                        "unsupported parameter pattern in RustLightAST parser",
+                    ));
+                }
             };
-            // DEFENSE: ref changes the binding's type; @ introduces a pattern
-            // that a single named parameter cannot carry.
-            if binding.by_ref.is_some() || binding.subpat.is_some() {
-                return Err(syn::Error::new_spanned(
-                    binding,
-                    "unsupported ref or @ function parameter binding in RustLightAST parser",
-                ));
-            }
             Ok(Param {
-                name: binding.ident.to_string(),
+                name,
                 ty: convert_type(&parameter.ty)?,
-                mutable: binding.mutability.is_some(),
+                mutable,
             })
         }
     }
@@ -383,40 +384,41 @@ fn convert_impl_item(item: &SynImplItem) -> syn::Result<ImplItem> {
     }
 }
 
-fn convert_use_tree(tree: &syn::UseTree) -> UseStatement {
-    match tree {
-        syn::UseTree::Path(path) => {
-            let mut converted = convert_use_tree(&path.tree);
-            converted.path.insert(0, path.ident.to_string());
-            converted
-        }
-        syn::UseTree::Name(name) => UseStatement {
-            path: vec![name.ident.to_string()],
-            kind: UseKind::Simple,
-        },
-        syn::UseTree::Glob(_) => UseStatement {
-            path: Vec::new(),
-            kind: UseKind::Glob,
-        },
-        syn::UseTree::Group(group) => UseStatement {
-            path: Vec::new(),
-            kind: UseKind::Nested(
-                group
-                    .items
-                    .iter()
-                    .map(use_tree_to_string)
-                    .collect::<Vec<_>>(),
-            ),
-        },
-        syn::UseTree::Rename(rename) => UseStatement {
-            path: vec![format!("{} as {}", rename.ident, rename.rename)],
-            kind: UseKind::Simple,
-        },
+fn convert_use(item: &syn::ItemUse) -> UseStatement {
+    let mut path = Vec::new();
+    let kind = convert_use_tree(&item.tree, &mut path);
+    UseStatement {
+        path,
+        kind,
+        absolute: item.leading_colon.is_some(),
+        vis: convert_visibility(&item.vis),
+        attrs: item.attrs.iter().map(attribute_to_raw_source).collect(),
     }
 }
 
-fn use_tree_to_string(tree: &syn::UseTree) -> String {
-    tree.to_token_stream().to_string().replace(" :: ", "::")
+fn convert_use_tree(tree: &syn::UseTree, segments: &mut Vec<String>) -> UseKind {
+    match tree {
+        syn::UseTree::Path(path) => {
+            segments.push(path.ident.to_string());
+            convert_use_tree(&path.tree, segments)
+        }
+        syn::UseTree::Name(name) => {
+            segments.push(name.ident.to_string());
+            UseKind::Simple
+        }
+        syn::UseTree::Glob(_) => UseKind::Glob,
+        syn::UseTree::Group(group) => UseKind::Nested(
+            group
+                .items
+                .iter()
+                .map(|tree| normalize_tokens(tree.to_token_stream()))
+                .collect(),
+        ),
+        syn::UseTree::Rename(rename) => {
+            segments.push(format!("{} as {}", rename.ident, rename.rename));
+            UseKind::Simple
+        }
+    }
 }
 
 fn convert_return_type(output: &ReturnType) -> syn::Result<Type> {
@@ -666,7 +668,7 @@ fn convert_block(block: &syn::Block) -> syn::Result<Block> {
 
     for (index, stmt) in block.stmts.iter().enumerate() {
         match stmt {
-            Stmt::Local(local) => stmts.push(Statement::Let(convert_local(local)?)),
+            Stmt::Local(local) => stmts.push(convert_local(local)?),
             Stmt::Item(item) => {
                 // Signature metadata is restored only for module/impl declarations.
                 // Keep local declarations opaque to retain lifetimes and opaque return capabilities.
@@ -681,15 +683,21 @@ fn convert_block(block: &syn::Block) -> syn::Result<Block> {
                     tail_expr = Some(Box::new(convert_expr(expr)?));
                 }
             }
-            Stmt::Macro(mac) => {
-                // A statement-position macro can contain syntax outside the
-                // lightweight AST (notably the `macro_rules!` declarations in
-                // the native Word adapter). Preserve it verbatim as an opaque
-                // item so the rest of the module, including explicit trait
-                // impls, remains available to package-wide analyses.
-                let source = normalize_tokens(mac.to_token_stream());
-                stmts.push(Statement::Item(Box::new(Item::Raw(source))));
-            }
+            Stmt::Macro(statement) => stmts.push(Statement::Macro(crate::MacroStmt {
+                attrs: statement
+                    .attrs
+                    .iter()
+                    .map(|attr| attr.to_token_stream().to_string())
+                    .collect(),
+                path: normalize_path_tokens(statement.mac.path.to_token_stream()),
+                delimiter: match statement.mac.delimiter {
+                    syn::MacroDelimiter::Paren(_) => crate::MacroDelimiter::Parenthesis,
+                    syn::MacroDelimiter::Brace(_) => crate::MacroDelimiter::Brace,
+                    syn::MacroDelimiter::Bracket(_) => crate::MacroDelimiter::Bracket,
+                },
+                tokens: statement.mac.tokens.to_string(),
+                semicolon: statement.semi_token.is_some(),
+            })),
         }
     }
 
@@ -699,7 +707,26 @@ fn convert_block(block: &syn::Block) -> syn::Result<Block> {
     })
 }
 
-fn convert_local(local: &syn::Local) -> syn::Result<LetStmt> {
+fn convert_local(local: &syn::Local) -> syn::Result<Statement> {
+    let attrs = local
+        .attrs
+        .iter()
+        .map(|attr| normalize_tokens(attr.to_token_stream()))
+        .collect();
+    if let Some(LocalInit {
+        expr,
+        diverge: Some((_, else_expr)),
+        ..
+    }) = &local.init
+    {
+        return Ok(Statement::LetElse {
+            attrs,
+            pattern: pattern::convert_pattern(&local.pat)?,
+            value: Box::new(convert_expr(expr)?),
+            else_block: expr_to_block(else_expr)?,
+        });
+    }
+
     let (name, ifmut, ty) = match &local.pat {
         Pat::Type(typed) => (
             typed.pat.to_token_stream().to_string(),
@@ -708,36 +735,26 @@ fn convert_local(local: &syn::Local) -> syn::Result<LetStmt> {
         ),
         Pat::Ident(PatIdent {
             ident,
+            by_ref: None,
             mutability,
-            subpat,
+            subpat: None,
             ..
-        }) => {
-            if subpat.is_some() {
-                return Err(syn::Error::new_spanned(
-                    &local.pat,
-                    "unsupported at-pattern local binding in RustLightAST parser",
-                ));
-            }
-            (ident.to_string(), mutability.is_some(), None)
-        }
+        }) => (ident.to_string(), mutability.is_some(), None),
         pat => (pat.to_token_stream().to_string(), false, None),
     };
 
-    // DEFENSE: the else block of a let-else is part of its control flow.
-    if let Some(init) = local.init.as_ref().filter(|init| init.diverge.is_some()) {
-        return Err(syn::Error::new_spanned(init.expr.as_ref(), "unsupported let-else"));
-    }
     let init = match &local.init {
         Some(LocalInit { expr, .. }) => Some(convert_expr(expr)?),
         None => None,
     };
 
-    Ok(LetStmt {
+    Ok(Statement::Let(LetStmt {
+        attrs,
         ifmut,
         name,
         ty,
         init,
-    })
+    }))
 }
 
 fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
@@ -1149,14 +1166,6 @@ pub fn convert_visibility(vis: &SynVisibility) -> Visibility {
                 .collect(),
         ),
         SynVisibility::Inherited => Visibility::Private,
-    }
-}
-
-fn visibility_to_source(vis: &Visibility) -> String {
-    match vis {
-        Visibility::Public => "pub ".to_string(),
-        Visibility::Private | Visibility::None => String::new(),
-        Visibility::Restricted(path) => format!("pub(in {}) ", path.join("::")),
     }
 }
 

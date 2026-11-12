@@ -43,6 +43,70 @@ fn optimizer_type_argument_helper_remains_available() {
 }
 
 #[test]
+fn macro_statements_roundtrip_delimiters_attributes_and_semicolons() {
+    use rustlightast::{MacroDelimiter, Statement};
+
+    let source = r#"
+#[macro_export]
+macro_rules! add {
+    ($out:ident, $value:expr) => { $out = $out + $value; };
+}
+fn total() -> u32 {
+    let mut sum = 0;
+    #[cfg(any())]
+    crate::add!(sum, 100);
+    crate::add!(sum, (1));
+    crate::add![sum, 2];
+    crate::add! { sum, 4 }
+    crate::add! { sum, 8 };
+    sum
+}
+"#;
+    let module = parse_rust_source(source, "macros").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    let reparsed = parse_rust_source(&printed, "roundtrip").unwrap();
+
+    for module in [&module, &reparsed] {
+        let function = module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Function(function) => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let statements: Vec<_> = function
+            .body
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                Statement::Macro(statement) => Some(statement),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statements
+                .iter()
+                .map(|statement| { (statement.delimiter, statement.semicolon) })
+                .collect::<Vec<_>>(),
+            [
+                (MacroDelimiter::Parenthesis, true),
+                (MacroDelimiter::Parenthesis, true),
+                (MacroDelimiter::Bracket, true),
+                (MacroDelimiter::Brace, false),
+                (MacroDelimiter::Brace, true),
+            ]
+        );
+        assert!(statements
+            .iter()
+            .all(|statement| statement.path == "crate::add"));
+        assert_eq!(statements[0].attrs.len(), 1);
+        assert!(statements[0].attrs[0].contains("cfg"));
+        assert!(statements[1].tokens.contains("(1)"));
+    }
+}
+
+#[test]
 fn parser_rejects_labels_in_control_flow() {
     for source in [
         "fn f() { 'outer: loop { break 'outer; } }",
@@ -52,10 +116,13 @@ fn parser_rejects_labels_in_control_flow() {
         "fn f() { loop { continue 'outer; } }",
         "fn f() { loop { break 'outer; } }",
     ] {
-        assert!(parse_rust_source(source, "unsupported")
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported expression label"), "{source}");
+        assert!(
+            parse_rust_source(source, "unsupported")
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported expression label"),
+            "{source}"
+        );
     }
 }
 
@@ -152,13 +219,14 @@ pub fn callback() -> impl for<'a> Fn(&'a u32) -> &'a u32 + Clone { |value| value
 
 #[test]
 fn parameter_reassignment_retains_the_mutable_binding() {
-    let source = "pub fn advance(mut value: u32) -> u32 { value = value + 1; value }";
+    let source = "pub fn advance(mut value: u32, _: u32) -> u32 { value = value + 1; value }";
     let module = parse_rust_source(source, "parameter_binding").unwrap();
     let Item::Function(function) = &module.items[0] else {
         panic!("expected function");
     };
-    assert_eq!(function.params[0].name, "value");
+    assert_eq!(function.params[0].binding_name(), Some("value"));
+    assert_eq!(function.params[1].binding_name(), None);
     let printed = RustCodeGenerator::new().generate_module_code(&module);
-    assert!(printed.contains("advance(mut value: u32)"));
+    assert!(printed.contains("advance(mut value: u32, _: u32)"));
     parse_rust_source(&printed, "roundtrip").unwrap();
 }
