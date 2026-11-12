@@ -1,11 +1,11 @@
-//! Preorder expression traversal over the RustLight AST.
+//! Mutable expression traversal over the RustLight AST.
 
-use crate::{Block, BuilderMethod, Expr, Statement};
+use crate::{Block, BuilderMethod, Expr, LetStmt, MacroStmt, Statement};
 
 /// Visit a block's expressions in source order. Item bodies are separate roots.
 pub fn visit_block(block: &mut Block, visit: &mut impl FnMut(&mut Expr) -> bool) {
     Expressions {
-        visit,
+        callback: Preorder(visit),
         local_functions: false,
     }
     .block(block);
@@ -17,7 +17,7 @@ pub fn visit_block_with_local_functions(
     visit: &mut impl FnMut(&mut Expr) -> bool,
 ) {
     Expressions {
-        visit,
+        callback: Preorder(visit),
         local_functions: true,
     }
     .block(block);
@@ -26,18 +26,124 @@ pub fn visit_block_with_local_functions(
 /// Visit an expression before its children. Return false to skip its subtree.
 pub fn visit_expr(expression: &mut Expr, visit: &mut impl FnMut(&mut Expr) -> bool) {
     Expressions {
-        visit,
+        callback: Preorder(visit),
         local_functions: false,
     }
     .expression(expression);
 }
 
-struct Expressions<'a, F> {
-    visit: &'a mut F,
+/// Visit a block's expressions after their children. Item bodies are separate roots.
+pub fn visit_block_postorder(block: &mut Block, visit: &mut impl FnMut(&mut Expr)) {
+    visit_block_postorder_with_locals(block, visit, &mut |_| {});
+}
+
+/// Visit expressions after their children and bindings after their initializer.
+pub fn visit_block_postorder_with_locals(
+    block: &mut Block,
+    visit: &mut impl FnMut(&mut Expr),
+    visit_local: &mut impl FnMut(&mut LetStmt),
+) {
+    Expressions {
+        callback: Postorder(visit, visit_local),
+        local_functions: false,
+    }
+    .block(block);
+}
+
+/// Visit expressions and blocks after their children. Item bodies are separate roots.
+pub fn visit_block_postorder_with_blocks(
+    block: &mut Block,
+    visit: &mut impl FnMut(&mut Expr),
+    leave_block: &mut impl FnMut(&mut Block),
+) {
+    Expressions {
+        callback: PostorderBlocks(visit, leave_block),
+        local_functions: false,
+    }
+    .block(block);
+}
+
+/// A macro invocation inside an expression or a statement.
+pub enum MacroNodeMut<'a> {
+    Expression(&'a mut String),
+    Statement(&'a mut MacroStmt),
+}
+
+/// Visit a block's macro invocations in source order. The payload is opaque.
+pub fn visit_block_macros(block: &mut Block, visit: &mut impl FnMut(MacroNodeMut<'_>)) {
+    Expressions {
+        callback: Macros(visit),
+        local_functions: false,
+    }
+    .block(block);
+}
+
+trait Callback {
+    fn enter(&mut self, _: &mut Expr) -> bool {
+        true
+    }
+
+    fn leave(&mut self, _: &mut Expr) {}
+
+    fn leave_block(&mut self, _: &mut Block) {}
+
+    fn leave_local(&mut self, _: &mut LetStmt) {}
+
+    fn leave_macro_statement(&mut self, _: &mut MacroStmt) {}
+}
+
+struct Preorder<F>(F);
+
+impl<F: FnMut(&mut Expr) -> bool> Callback for Preorder<F> {
+    fn enter(&mut self, expression: &mut Expr) -> bool {
+        (self.0)(expression)
+    }
+}
+
+struct Postorder<F, L>(F, L);
+
+impl<F: FnMut(&mut Expr), L: FnMut(&mut LetStmt)> Callback for Postorder<F, L> {
+    fn leave(&mut self, expression: &mut Expr) {
+        (self.0)(expression);
+    }
+
+    fn leave_local(&mut self, local: &mut LetStmt) {
+        (self.1)(local)
+    }
+}
+
+struct PostorderBlocks<E, B>(E, B);
+
+impl<E: FnMut(&mut Expr), B: FnMut(&mut Block)> Callback for PostorderBlocks<E, B> {
+    fn leave(&mut self, expression: &mut Expr) {
+        (self.0)(expression)
+    }
+
+    fn leave_block(&mut self, block: &mut Block) {
+        (self.1)(block)
+    }
+}
+
+struct Macros<F>(F);
+
+impl<F: FnMut(MacroNodeMut<'_>)> Callback for Macros<F> {
+    fn leave(&mut self, expression: &mut Expr) {
+        if let Expr::Macro(source) = expression {
+            (self.0)(MacroNodeMut::Expression(source));
+        }
+    }
+
+    fn leave_macro_statement(&mut self, statement: &mut MacroStmt) {
+        (self.0)(MacroNodeMut::Statement(statement));
+    }
+}
+
+struct Expressions<C> {
+    callback: C,
     local_functions: bool,
 }
 
-impl<F: FnMut(&mut Expr) -> bool> Expressions<'_, F> {
+impl<C: Callback> Expressions<C> {
     fn block(&mut self, block: &mut Block) {
         for statement in &mut block.stmts {
             match statement {
@@ -45,6 +151,7 @@ impl<F: FnMut(&mut Expr) -> bool> Expressions<'_, F> {
                     if let Some(expr) = &mut local.init {
                         self.expression(expr);
                     }
+                    self.callback.leave_local(local);
                 }
                 Statement::LetElse {
                     value, else_block, ..
@@ -58,15 +165,17 @@ impl<F: FnMut(&mut Expr) -> bool> Expressions<'_, F> {
                         self.block(&mut function.body);
                     }
                 }
-                Statement::Item(_) | Statement::Macro(_) | Statement::Comment(_) => {}
+                Statement::Macro(statement) => self.callback.leave_macro_statement(statement),
+                Statement::Item(_) | Statement::Comment(_) => {}
             }
         }
         if let Some(expr) = &mut block.expr {
             self.expression(expr);
         }
+        self.callback.leave_block(block);
     }
     fn expression(&mut self, expression: &mut Expr) {
-        if !(self.visit)(expression) {
+        if !self.callback.enter(expression) {
             return;
         }
         match expression {
@@ -180,5 +289,6 @@ impl<F: FnMut(&mut Expr) -> bool> Expressions<'_, F> {
             | Expr::Break { value: None, .. }
             | Expr::Continue(_) => {}
         }
+        self.callback.leave(expression);
     }
 }

@@ -1,6 +1,7 @@
 pub mod rustlight_ast;
 pub mod rustlight_parser;
 pub mod rustlight_print;
+pub mod visit;
 pub mod visit_mut;
 
 pub use rustlight_ast::*;
