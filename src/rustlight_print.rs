@@ -25,6 +25,19 @@ impl RustCodeGenerator {
         }
     }
 
+    /// Print one modeled Rust type at the source boundary.
+    pub fn generate_type_code(&self, ty: &Type) -> String {
+        self.type_to_string(ty)
+    }
+
+    /// Print an expression for placement at an existing source node.
+    pub fn generate_expression_code(&mut self, expression: &Expr) -> String {
+        self.buffer.clear();
+        self.indent_level = 0;
+        self.generate_expr(expression);
+        self.buffer.clone()
+    }
+
     // Main entry: generate full module code
     pub fn generate_module_code(&mut self, module: &RustModule) -> String {
         self.buffer.clear();
@@ -86,6 +99,13 @@ impl RustCodeGenerator {
     }
 
     fn generate_nested_module(&mut self, m: &RustModule) {
+        for doc in &m.docs {
+            self.writeln(doc);
+        }
+        for attr in &m.attrs {
+            self.generate_attribute(attr);
+        }
+
         // Generate the module declaration line
         match &m.vis {
             Visibility::Public => self.write("pub "),
@@ -97,15 +117,6 @@ impl RustCodeGenerator {
         self.writeln(&format!("mod {} {{", m.name));
         self.indent();
 
-        // Module-level docs and attributes
-        for doc in &m.docs {
-            self.writeln(doc);
-        }
-        for attr in &m.attrs {
-            self.generate_attribute(attr);
-        }
-
-        // Module contents
         self.generate_items(&m.items);
 
         self.dedent();
@@ -575,6 +586,7 @@ impl RustCodeGenerator {
                 self.write("}");
             }
             Expr::For {
+                label,
                 pattern,
                 iter,
                 body,
@@ -827,6 +839,10 @@ impl RustCodeGenerator {
 
     fn generate_jump_expr(&mut self, keyword: &str, value: Option<&Expr>) {
         self.write(keyword);
+        if let Some(label) = label {
+            self.write(" '");
+            self.write(label);
+        }
         if let Some(value) = value {
             self.write(" ");
             self.generate_expr(value);
@@ -1603,6 +1619,7 @@ mod tests {
     fn prints_for_loop() {
         let printed = print_function_body(
             Expr::For {
+                label: None,
                 pattern: Pattern::Ident {
                     name: "i".to_string(),
                     mode: BindingMode::Value,

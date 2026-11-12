@@ -18,6 +18,38 @@ fn downstream_consumer_can_parse_and_print_without_an_optimizer() {
 }
 
 #[test]
+fn local_attributes_survive_a_modeled_function_roundtrip() {
+    use quote::ToTokens;
+
+    let source = r#"
+fn read(input: Option<u32>) -> u32 {
+    fn worker(input: Option<u32>) -> u32 {
+        #[allow(unused_mut)]
+        let mut pending = input;
+        #[allow(unused_variables)]
+        let Some(value) = pending else { return 0; };
+        value
+    }
+    worker(input)
+}
+"#;
+    let module = parse_rust_source(source, "read").unwrap();
+    let Item::Function(read) = &module.items[0] else {
+        panic!("expected function");
+    };
+    let Statement::Item(worker) = &read.body.stmts[0] else {
+        panic!("expected a local function statement");
+    };
+    assert!(matches!(worker.as_ref(), Item::Function(_)));
+
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    assert_eq!(
+        syn::parse_file(&printed).unwrap().to_token_stream().to_string(),
+        syn::parse_file(source).unwrap().to_token_stream().to_string(),
+    );
+}
+
+#[test]
 fn unsupported_body_still_allows_marked_type_fact_recovery() {
     let source = "pub fn bytes() -> [u8; 4] { const { [0u8; 4] } }";
     let _: ParseError = parse_rust_source(source, "example").unwrap_err();
@@ -41,6 +73,62 @@ fn optimizer_type_argument_helper_remains_available() {
     assert!(first_explicit_type_argument("identity").is_none());
     assert!(first_explicit_type_argument("identity::<").is_none());
 }
+
+#[test]
+fn inline_module_attributes_keep_their_targets() {
+    let source = r#"
+#[cfg(test)] mod tests {
+    #![allow(dead_code)]
+    use super::*;
+    pub fn value() -> u32 { test_value() }
+}
+"#;
+    let parsed = syn::parse_file(source).unwrap();
+    for module in [
+        parse_rust_source(source, "adapter").unwrap(),
+        rustlightast::rustlight_parser::convert_file_preserving_items(&parsed, "adapter".into()),
+    ] {
+        let output = RustCodeGenerator::new().generate_module_code(&module);
+        let output = syn::parse_file(&output).unwrap();
+        let syn::Item::Mod(tests) = &output.items[0] else {
+            panic!("expected a test module");
+        };
+        assert_eq!(tests.attrs.len(), 2);
+        assert!(matches!(tests.attrs[0].style, syn::AttrStyle::Outer));
+        assert!(tests.attrs[0].path().is_ident("cfg"));
+        assert!(matches!(tests.attrs[1].style, syn::AttrStyle::Inner(_)));
+        assert!(tests.attrs[1].path().is_ident("allow"));
+        let (_, items) = tests.content.as_ref().unwrap();
+        let syn::Item::Use(import) = &items[0] else {
+            panic!("expected the first declaration to be an import");
+        };
+        assert!(import.attrs.is_empty());
+    }
+}
+
+#[test]
+fn let_else_preserves_its_binding_and_failure_branch() {
+    let source = r#"
+fn min_key(cases: &[(u32, u32)], default: u32) -> u32 {
+    let Some(minkey): Option<u32> = cases
+        .iter()
+        .map(|(key, _)| key)
+        .min_by(|left, right| left.cmp(right))
+        .cloned()
+    else {
+        return default;
+    };
+    minkey
+}
+"#;
+    let module = parse_rust_source(source, "let_else").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    assert!(printed.contains("let Some(minkey): Option<u32>"));
+    assert!(printed.contains(".cloned() else {"));
+    assert!(printed.contains("return default;"));
+    parse_rust_source(&printed, "roundtrip").unwrap();
+}
+
 
 #[test]
 fn macro_statements_roundtrip_delimiters_attributes_and_semicolons() {

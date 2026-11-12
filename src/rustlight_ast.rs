@@ -8,10 +8,13 @@ pub use pattern::{BindingMode, Pattern, PatternField};
 #[derive(Debug, Clone)]
 pub struct RustModule {
     pub name: String,
+    /// Outer documentation on an inline module declaration.
     pub docs: Vec<String>,
+    /// Inner attributes, if any, precede the declarations as raw items.
     pub items: Vec<Item>,
-    pub attrs: Vec<Attribute>, // #[attributes]
-    pub vis: Visibility,       // controls the visibility of the module
+    /// Outer attributes on an inline module declaration.
+    pub attrs: Vec<Attribute>,
+    pub vis: Visibility, // controls the visibility of the module
 }
 
 /// Module item definitions
