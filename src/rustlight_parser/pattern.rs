@@ -23,7 +23,8 @@ fn parse_pattern(input: ParseStream<'_>) -> syn::Result<Pattern> {
     }
 }
 
-pub(super) fn convert_pattern(pattern: &Pat) -> syn::Result<Pattern> {
+/// Convert a parsed Rust binding pattern into RustLightAST.
+pub fn convert_pattern(pattern: &Pat) -> syn::Result<Pattern> {
     match pattern {
         Pat::Ident(binding) => Ok(Pattern::Ident {
             name: binding.ident.to_string(),

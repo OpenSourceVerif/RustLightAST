@@ -30,7 +30,7 @@ pub enum Item {
     TypeAlias(TypeAlias),
     Use(UseStatement),
     Mod(Box<RustModule>),      // nested module
-    ModuleDecl(ModuleDecl),   // out-of-line module
+    ModuleDecl(ModuleDecl),    // out-of-line module
     LazyStatic(LazyStaticDef), // lazy_static! macro
 }
 
@@ -125,12 +125,12 @@ pub enum Type {
     },
     /// Reference target, optional explicit lifetime, and mutability.
     Reference(Box<Type>, Option<String>, bool),
-    Tuple(Vec<Type>),                 // (T1, T2)
-    Slice(Box<Type>),                 // [T]
-    Array(Box<Type>, usize),          // [T; N] fixed-size array
-    Unit,                             // ()
-    Never,                            // !
-    Infer,                            // _
+    Tuple(Vec<Type>),        // (T1, T2)
+    Slice(Box<Type>),        // [T]
+    Array(Box<Type>, usize), // [T; N] fixed-size array
+    Unit,                    // ()
+    Never,                   // !
+    Infer,                   // _
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +391,9 @@ pub struct MatchArm {
     pub pattern: Pattern,
     pub guard: Option<Expr>,
     pub body: Block,
+    /// An explicit block in the source remains a block even with no statements.
+    pub braced: bool,
+    pub comma: bool,
 }
 
 // Distinguish different builder methods such as .name(), .stack_size(), etc.
@@ -524,8 +527,14 @@ impl From<Vec<GenericParam>> for Generics {
 
 #[derive(Debug, Clone)]
 pub enum WherePredicate {
-    Type { subject: Type, bounds: Vec<String> },
-    Lifetime { subject: String, bounds: Vec<String> },
+    Type {
+        subject: Type,
+        bounds: Vec<String>,
+    },
+    Lifetime {
+        subject: String,
+        bounds: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -1,7 +1,7 @@
 use rustlightast::{
     parse_rust_source, parse_rust_type_facts,
     rustlight_parser::{first_explicit_type_argument, TYPE_FACT_ONLY_DOC},
-    Expr, Item, Member, ParseError, RustCodeGenerator, Type,
+    Expr, Item, Member, ParseError, RustCodeGenerator, Statement, Type,
 };
 
 #[test]
@@ -47,6 +47,50 @@ fn read(input: Option<u32>) -> u32 {
         syn::parse_file(&printed).unwrap().to_token_stream().to_string(),
         syn::parse_file(source).unwrap().to_token_stream().to_string(),
     );
+}
+
+#[test]
+fn binary_operations_keep_leading_blocks_in_statements_and_tails() {
+    let mut module = parse_rust_source(
+        "fn sum() -> u32 { let value = { 1 } + { 2 } + 3; value }",
+        "sum",
+    )
+    .unwrap();
+    let Item::Function(function) = &mut module.items[0] else {
+        panic!("expected function");
+    };
+    let Statement::Let(binding) = &function.body.stmts[0] else {
+        panic!("expected binding");
+    };
+    let sum = binding.init.clone().unwrap();
+    function.body.stmts.push(Statement::Expr(sum.clone()));
+    function.body.expr = Some(Box::new(sum));
+
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    let parsed = parse_rust_source(&printed, "roundtrip").unwrap();
+    let Item::Function(function) = &parsed.items[0] else {
+        panic!("expected function");
+    };
+    let [Statement::Let(binding), Statement::Expr(statement)] = function.body.stmts.as_slice()
+    else {
+        panic!("expected one binding and one expression statement");
+    };
+    fn first_operand(expression: &Expr) -> &Expr {
+        match expression {
+            Expr::BinaryOp(left, _, _) => first_operand(left),
+            other => other,
+        }
+    }
+    assert!(matches!(
+        first_operand(binding.init.as_ref().unwrap()),
+        Expr::Block(_)
+    ));
+    for expression in [statement, function.body.expr.as_deref().unwrap()] {
+        assert!(matches!(
+            first_operand(expression),
+            Expr::Parenthesized(operand) if matches!(operand.as_ref(), Expr::Block(_))
+        ));
+    }
 }
 
 #[test]
@@ -128,7 +172,6 @@ fn min_key(cases: &[(u32, u32)], default: u32) -> u32 {
     assert!(printed.contains("return default;"));
     parse_rust_source(&printed, "roundtrip").unwrap();
 }
-
 
 #[test]
 fn macro_statements_roundtrip_delimiters_attributes_and_semicolons() {

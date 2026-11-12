@@ -6,6 +6,88 @@ mod pattern;
 
 const MAX_FUNCTION_SIGNATURE_WIDTH: usize = 80;
 
+// In increasing binding strength, following the Rust Reference's expression table.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Precedence {
+    Jump,
+    Assignment,
+    Range,
+    Or,
+    And,
+    Comparison,
+    BitOr,
+    BitXor,
+    BitAnd,
+    Shift,
+    Sum,
+    Product,
+    Cast,
+    Prefix,
+    Postfix,
+    Atom,
+}
+
+impl Precedence {
+    fn binary(op: &str) -> Self {
+        match op {
+            "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>=" => {
+                Self::Assignment
+            }
+            "||" => Self::Or,
+            "&&" => Self::And,
+            "==" | "!=" | "<" | ">" | "<=" | ">=" => Self::Comparison,
+            "|" => Self::BitOr,
+            "^" => Self::BitXor,
+            "&" => Self::BitAnd,
+            "<<" | ">>" => Self::Shift,
+            "+" | "-" => Self::Sum,
+            "*" | "/" | "%" => Self::Product,
+            _ => Self::Jump,
+        }
+    }
+
+    fn of(expr: &Expr) -> Self {
+        match expr {
+            Expr::Closure(..)
+            | Expr::TypedClosure(..)
+            | Expr::Return(..)
+            | Expr::Break { .. }
+            | Expr::Continue(..) => Self::Jump,
+            Expr::Assign(..) => Self::Assignment,
+            Expr::Range { .. } => Self::Range,
+            Expr::BinaryOp(_, op, _) => Self::binary(op),
+            Expr::Reference(inner, false, false) => Self::of(inner),
+            Expr::Reference(..) | Expr::UnaryOp(..) => Self::Prefix,
+            Expr::Literal(Literal::Int(value)) if *value < 0 => Self::Prefix,
+            Expr::Literal(Literal::Float(value)) if value.is_sign_negative() => Self::Prefix,
+            Expr::Call(..)
+            | Expr::MethodCall(..)
+            | Expr::Index(..)
+            | Expr::Field { .. }
+            | Expr::Await(..)
+            | Expr::Try(..) => Self::Postfix,
+            // Casts print with their own parentheses except in call arguments.
+            _ => Self::Atom,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpressionPosition {
+    Free,
+    StatementHead,
+    BeforeBlock,
+}
+
+impl ExpressionPosition {
+    fn without_statement_head(self) -> Self {
+        match self {
+            Self::StatementHead => Self::Free,
+            position => position,
+        }
+    }
+}
+
 // Rust code generator
 pub struct RustCodeGenerator {
     buffer: String,
@@ -79,6 +161,22 @@ impl RustCodeGenerator {
         self.buffer.clone()
     }
 
+    /// Render a braced block at the source boundary.
+    pub fn generate_block_code(&mut self, block: &Block) -> String {
+        self.buffer.clear();
+        self.indent_level = 0;
+        self.generate_braced_block(block);
+        self.buffer.clone()
+    }
+
+    /// Render one declaration for publication at its existing source scope.
+    pub fn generate_item_code(&mut self, item: &Item) -> String {
+        self.buffer.clear();
+        self.indent_level = 0;
+        self.generate_item(item);
+        self.buffer.clone()
+    }
+
     // Main entry: generate full module code
     pub fn generate_module_code(&mut self, module: &RustModule) -> String {
         self.buffer.clear();
@@ -126,7 +224,11 @@ impl RustCodeGenerator {
                 for attr in &module.attrs {
                     self.writeln(attr);
                 }
-                self.writeln(&format!("{}mod {};", self.visibility(&module.vis), module.name));
+                self.writeln(&format!(
+                    "{}mod {};",
+                    self.visibility(&module.vis),
+                    module.name
+                ));
             }
             Item::LazyStatic(l) => self.generate_lazy_static(l),
         }
@@ -308,7 +410,11 @@ impl RustCodeGenerator {
             self.writeln("where");
             self.indent();
             for (position, clause) in where_clauses.iter().enumerate() {
-                let comma = if position + 1 < where_clauses.len() { "," } else { "" };
+                let comma = if position + 1 < where_clauses.len() {
+                    ","
+                } else {
+                    ""
+                };
                 self.writeln(&format!("{clause}{comma}"));
             }
             self.dedent();
@@ -365,7 +471,11 @@ impl RustCodeGenerator {
             self.type_to_string(&param.ty)
         } else {
             let modifier = if param.mutable { "mut " } else { "" };
-            format!("{modifier}{}: {}", param.name, self.type_to_string(&param.ty))
+            format!(
+                "{modifier}{}: {}",
+                param.name,
+                self.type_to_string(&param.ty)
+            )
         }
     }
 
@@ -379,7 +489,13 @@ impl RustCodeGenerator {
         bounded_generics.sort_by(|left, right| left.name.cmp(&right.name));
         bounded_generics
             .into_iter()
-            .map(|param| format!("{}: {}", param.name, ordered_bounds_to_string(&param.bounds)))
+            .map(|param| {
+                format!(
+                    "{}: {}",
+                    param.name,
+                    ordered_bounds_to_string(&param.bounds)
+                )
+            })
             .chain(
                 generics
                     .where_predicates
@@ -415,21 +531,8 @@ impl RustCodeGenerator {
         }
 
         if let Some(expr) = &block.expr {
-            self.generate_expr(expr);
+            self.generate_expr_at(expr, ExpressionPosition::StatementHead);
             self.writeln("");
-        }
-    }
-
-    // Dedicated method for generating match arm bodies
-    fn generate_match_arm_body(&mut self, block: &Block) {
-        for stmt in &block.stmts {
-            self.generate_statement(stmt);
-        }
-
-        if let Some(expr) = &block.expr {
-            self.generate_expr(expr);
-            self.writeln("");
-            // The last expression in a match arm should never end with a semicolon, since it is the return value
         }
     }
 
@@ -473,7 +576,7 @@ impl RustCodeGenerator {
                 self.writeln("};");
             }
             Statement::Expr(expr) => {
-                self.generate_expr(expr);
+                self.generate_expr_at(expr, ExpressionPosition::StatementHead);
                 self.writeln(";");
             }
             Statement::Macro(statement) => {
@@ -500,6 +603,10 @@ impl RustCodeGenerator {
     }
 
     fn generate_expr(&mut self, expr: &Expr) {
+        self.generate_expr_at(expr, ExpressionPosition::Free);
+    }
+
+    fn generate_expr_at(&mut self, expr: &Expr, position: ExpressionPosition) {
         match expr {
             Expr::Ident(id) => self.write(id),
             Expr::Macro(source) => self.write(source),
@@ -518,12 +625,16 @@ impl RustCodeGenerator {
                 if let Some(trait_path) = &qualification.trait_path {
                     self.write(" as ");
                     self.generate_path(trait_path);
+            // A struct literal exposed before a control-flow body needs grouping.
+            Expr::Record { .. } if position == ExpressionPosition::BeforeBlock => {
+                self.generate_parenthesized(expr);
+            }
                 }
                 self.write(">::");
                 self.generate_path(path);
             }
             Expr::Field { base, member } => {
-                self.generate_postfix_base(base);
+                self.generate_postfix_base(base, position);
                 self.write(".");
                 self.generate_member(member);
             }
@@ -547,7 +658,11 @@ impl RustCodeGenerator {
                     self.write(if fields.is_empty() { " .." } else { ", .." });
                     self.generate_expr(rest);
                 }
-                self.write(if fields.is_empty() && rest.is_none() { "}" } else { " }" });
+                self.write(if fields.is_empty() && rest.is_none() {
+                    "}"
+                } else {
+                    " }"
+                });
             }
             Expr::Literal(lit) => self.generate_literal(lit),
             Expr::Array(items) => {
@@ -569,18 +684,23 @@ impl RustCodeGenerator {
             }
             Expr::Range { start, end } => {
                 if let Some(start) = start {
-                    self.generate_expr(start);
+                    self.generate_operand(start, Precedence::Range, false, position);
                 }
                 self.write(match end {
                     RangeEnd::Exclusive(_) => "..",
                     RangeEnd::Inclusive(_) => "..=",
                 });
                 if let Some(end) = end.expression() {
-                    self.generate_expr(end);
+                    self.generate_operand(
+                        end,
+                        Precedence::Range,
+                        false,
+                        position.without_statement_head(),
+                    );
                 }
             }
             Expr::Try(operand) => {
-                self.generate_postfix_base(operand);
+                self.generate_postfix_base(operand, position);
                 self.write("?");
             }
             Expr::Tuple(items) => {
@@ -597,7 +717,7 @@ impl RustCodeGenerator {
                 self.write(")");
             }
             Expr::Call(callee, args) => {
-                self.generate_expr(callee);
+                self.generate_callee(callee, position);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
@@ -608,9 +728,12 @@ impl RustCodeGenerator {
                 self.write(")");
             }
             Expr::MethodCall(receiver, method, args) => {
-                self.generate_expr(receiver);
-                if !method.is_empty() {
-                    self.write(&format!(".{}", method));
+                if method.is_empty() {
+                    self.generate_callee(receiver, position);
+                } else {
+                    self.generate_postfix_base(receiver, position);
+                    self.write(".");
+                    self.write(method);
                 }
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
@@ -634,10 +757,14 @@ impl RustCodeGenerator {
                 self.dedent();
                 self.write("}");
             }
-            Expr::While { label, condition, body } => {
+            Expr::While {
+                label,
+                condition,
+                body,
+            } => {
                 self.generate_label(label.as_deref());
                 self.write("while ");
-                self.generate_expr(condition);
+                self.generate_expr_at(condition, ExpressionPosition::BeforeBlock);
                 self.writeln(" {");
                 self.indent();
                 self.generate_block(body);
@@ -654,7 +781,7 @@ impl RustCodeGenerator {
                 self.write("for ");
                 self.generate_pattern(pattern);
                 self.write(" in ");
-                self.generate_expr(iter);
+                self.generate_expr_at(iter, ExpressionPosition::BeforeBlock);
                 self.writeln(" {");
                 self.indent();
                 self.generate_block(body);
@@ -665,7 +792,7 @@ impl RustCodeGenerator {
                 self.write("let ");
                 self.generate_pattern(pattern);
                 self.write(" = ");
-                self.generate_expr(value);
+                self.generate_let_scrutinee(value, position.without_statement_head());
             }
             Expr::Return(value) => self.generate_jump_expr("return", None, value.as_deref()),
             Expr::Break { label, value } => {
@@ -673,11 +800,15 @@ impl RustCodeGenerator {
             }
             Expr::Continue(label) => self.generate_jump_expr("continue", label.as_deref(), None),
             Expr::Async { body, move_capture } => {
-                self.write(if *move_capture { "async move " } else { "async " });
+                self.write(if *move_capture {
+                    "async move "
+                } else {
+                    "async "
+                });
                 self.generate_braced_block(body);
             }
             Expr::Await(expr) => {
-                self.generate_expr(expr);
+                self.generate_postfix_base(expr, position);
                 self.write(".await");
             }
             // The call chain for creating threads inside a process is currently hard-coded
@@ -716,14 +847,7 @@ impl RustCodeGenerator {
                     self.generate_closure_param(param);
                 }
                 self.write("| ");
-                match body.as_ref() {
-                    Expr::Block(_) => self.generate_expr(body),
-                    _ => {
-                        self.write("{ ");
-                        self.generate_expr(body);
-                        self.write(" }");
-                    }
-                }
+                self.generate_expr_at(body, position.without_statement_head());
             }
             Expr::TypedClosure(params, return_type, body, is_move) => {
                 if *is_move {
@@ -750,21 +874,47 @@ impl RustCodeGenerator {
             }
             Expr::Match { expr, arms } => {
                 self.write("match ");
-                self.generate_expr(expr);
+                self.generate_expr_at(expr, ExpressionPosition::BeforeBlock);
                 self.writeln(" {");
                 self.indent();
-                for arm in arms {
+                for (index, arm) in arms.iter().enumerate() {
                     self.generate_pattern(&arm.pattern);
                     if let Some(guard) = &arm.guard {
                         self.write(" if ");
                         self.generate_expr(guard);
                     }
-                    self.writeln(" => {");
-                    self.indent();
-                    // Generate arm body, but do not add a semicolon to the final expression
-                    self.generate_match_arm_body(&arm.body);
-                    self.dedent();
-                    self.writeln("},");
+                    self.write(" => ");
+                    let needs_comma = match &arm.body.expr {
+                        Some(expr) if !arm.braced && arm.body.stmts.is_empty() => {
+                            self.generate_expr(expr);
+                            !matches!(
+                                expr.as_ref(),
+                                Expr::Block(_)
+                                    | Expr::LabeledBlock { .. }
+                                    | Expr::Async { .. }
+                                    | Expr::Unsafe(_)
+                                    | Expr::Loop(..)
+                                    | Expr::While { .. }
+                                    | Expr::For { .. }
+                                    | Expr::If { .. }
+                                    | Expr::IfLet { .. }
+                                    | Expr::Match { .. }
+                            )
+                        }
+                        _ => {
+                            self.writeln("{");
+                            self.indent();
+                            self.generate_block(&arm.body);
+                            self.dedent();
+                            self.write("}");
+                            false
+                        }
+                    };
+                    self.writeln(if arm.comma || (needs_comma && index + 1 < arms.len()) {
+                        ","
+                    } else {
+                        ""
+                    });
                 }
                 self.dedent();
                 self.write("}");
@@ -792,7 +942,7 @@ impl RustCodeGenerator {
                 else_branch,
             } => {
                 self.write("if ");
-                self.generate_expr(condition);
+                self.generate_expr_at(condition, ExpressionPosition::BeforeBlock);
                 self.write(" ");
                 self.writeln("{");
                 self.indent();
@@ -830,7 +980,7 @@ impl RustCodeGenerator {
                 self.write("if let ");
                 self.write(pattern);
                 self.write(" = ");
-                self.generate_expr(value);
+                self.generate_let_scrutinee(value, ExpressionPosition::BeforeBlock);
                 self.write(" {\n");
                 self.indent();
                 self.generate_block(then_branch);
@@ -845,45 +995,60 @@ impl RustCodeGenerator {
                     self.write("}");
                 }
             }
-            Expr::Reference(inner_expr, is_reference, mutable) => {
+            Expr::Reference(inner, is_reference, mutable) => {
                 if *is_reference {
                     self.write("&");
                 }
                 if *mutable {
                     self.write("mut ");
                 }
-                if matches!(
-                    inner_expr.as_ref(),
-                    Expr::BinaryOp(_, _, _)
-                        | Expr::Assign(_, _)
-                        | Expr::Cast(_, _)
-                        | Expr::Range { .. }
-                ) {
-                    self.write("(");
-                    self.generate_expr(inner_expr);
-                    self.write(")");
+                if *is_reference || *mutable {
+                    self.generate_operand(
+                        inner,
+                        Precedence::Prefix,
+                        true,
+                        position.without_statement_head(),
+                    );
                 } else {
-                    self.generate_expr(inner_expr);
+                    self.generate_expr_at(inner, position);
                 }
             }
             Expr::BinaryOp(left, op, right) => {
-                self.generate_expr(left);
+                let precedence = Precedence::binary(op);
+                let left_associative =
+                    !matches!(precedence, Precedence::Assignment | Precedence::Comparison);
+                self.generate_operand(left, precedence, left_associative, position);
                 self.write(" ");
                 self.write(op);
                 self.write(" ");
-                self.generate_expr(right);
+                self.generate_operand(
+                    right,
+                    precedence,
+                    precedence == Precedence::Assignment,
+                    position.without_statement_head(),
+                );
             }
             Expr::Assign(left, right) => {
-                self.generate_expr(left);
+                self.generate_operand(left, Precedence::Assignment, false, position);
                 self.write(" = ");
-                self.generate_expr(right);
+                self.generate_operand(
+                    right,
+                    Precedence::Assignment,
+                    true,
+                    position.without_statement_head(),
+                );
             }
             Expr::UnaryOp(op, expr) => {
                 self.write(op);
-                self.generate_expr(expr);
+                self.generate_operand(
+                    expr,
+                    Precedence::Prefix,
+                    true,
+                    position.without_statement_head(),
+                );
             }
             Expr::Index(array, index) => {
-                self.generate_expr(array);
+                self.generate_postfix_base(array, position);
                 self.write("[");
                 self.generate_expr(index);
                 self.write("]");
@@ -931,25 +1096,62 @@ impl RustCodeGenerator {
         }
     }
 
-    fn generate_postfix_base(&mut self, base: &Expr) {
-        let needs_parens = matches!(
-            base,
-            Expr::Assign(..)
-                | Expr::BinaryOp(..)
-                | Expr::Closure(..)
-                | Expr::TypedClosure(..)
-                | Expr::Return(_)
-                | Expr::Break { .. }
-                | Expr::Reference(..)
-                | Expr::UnaryOp(..)
-                | Expr::Range { .. }
-        );
-        if needs_parens {
-            self.write("(");
+    fn generate_let_scrutinee(&mut self, value: &Expr, position: ExpressionPosition) {
+        // A lazy boolean operator can start a new condition in a let chain.
+        self.generate_operand(value, Precedence::Comparison, true, position);
+    }
+
+    fn generate_operand(
+        &mut self,
+        expr: &Expr,
+        precedence: Precedence,
+        allow_equal: bool,
+        position: ExpressionPosition,
+    ) {
+        let actual = Precedence::of(expr);
+        // Rust can end a statement at a leading block before seeing its operator.
+        let leading_block = position == ExpressionPosition::StatementHead
+            && matches!(
+                expr,
+                Expr::Block(_)
+                    | Expr::LabeledBlock { .. }
+                    | Expr::Unsafe(_)
+                    | Expr::Loop(..)
+                    | Expr::While { .. }
+                    | Expr::For { .. }
+                    | Expr::If { .. }
+                    | Expr::IfLet { .. }
+                    | Expr::Match { .. }
+            );
+        if actual < precedence || (actual == precedence && !allow_equal) || leading_block {
+            self.generate_parenthesized(expr);
+        } else {
+            self.generate_expr_at(expr, position);
         }
-        self.generate_expr(base);
-        if needs_parens {
-            self.write(")");
+    }
+
+    fn generate_parenthesized(&mut self, expr: &Expr) {
+        self.write("(");
+        self.generate_expr(expr);
+        self.write(")");
+    }
+
+    fn generate_postfix_base(&mut self, base: &Expr, position: ExpressionPosition) {
+        self.generate_operand(base, Precedence::Postfix, true, position);
+    }
+
+    fn generate_callee(&mut self, callee: &Expr, position: ExpressionPosition) {
+        // An ungrouped named field followed by parentheses is a method call.
+        if matches!(
+            callee,
+            Expr::Field {
+                member: Member::Named(_),
+                ..
+            }
+        ) {
+            self.generate_parenthesized(callee);
+        } else {
+            self.generate_postfix_base(callee, position);
         }
     }
 
@@ -994,7 +1196,7 @@ impl RustCodeGenerator {
         if parenthesized {
             self.write("(");
         }
-        self.generate_expr(expr);
+        self.generate_operand(expr, Precedence::Cast, true, ExpressionPosition::Free);
         self.write(" as ");
         self.write(&self.type_to_string(ty));
         if parenthesized {
@@ -1175,7 +1377,9 @@ impl RustCodeGenerator {
             } => {
                 let arguments = associated_types
                     .iter()
-                    .map(|binding| format!("{} = {}", binding.name, self.type_to_string(&binding.ty)))
+                    .map(|binding| {
+                        format!("{} = {}", binding.name, self.type_to_string(&binding.ty))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("impl {}<{arguments}>", trait_path.join("::"))
@@ -1217,7 +1421,8 @@ impl RustCodeGenerator {
                 source
             }
             Type::Reference(inner, lifetime, mutable) => {
-                let (lifetime, separator) = lifetime.as_deref().map_or(("", ""), |name| (name, " "));
+                let (lifetime, separator) =
+                    lifetime.as_deref().map_or(("", ""), |name| (name, " "));
                 let mutable = if *mutable { "mut " } else { "" };
                 let source = self.type_to_string(inner);
                 if matches!(inner.as_ref(), Type::CallableTrait(callable)
@@ -1396,12 +1601,12 @@ fn ordered_bounds_to_string(bounds: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::RustCodeGenerator;
-    use crate::{BindingMode, Pattern};
     use crate::rustlight_ast::{
         Block, CallableTraitQualifier, CallableTraitType, ClosureParam, Expr, FunctionDef,
-        GenericParam, Item, Literal, Param, PathType, RustModule, Statement, Type, TypeAlias, TypeParameter,
-        Visibility,
+        GenericParam, Item, Literal, Param, PathType, RustModule, Statement, Type, TypeAlias,
+        TypeParameter, Visibility,
     };
+    use crate::{BindingMode, Pattern};
 
     fn callable_target() -> Type {
         Type::Generic(
@@ -1581,7 +1786,8 @@ mod tests {
                 generics: vec![GenericParam::Type(TypeParameter {
                     name: "T".to_string(),
                     bounds: vec!["Clone".to_string()],
-                })].into(),
+                })]
+                .into(),
                 vis: Visibility::Public,
                 docs: Vec::new(),
             })],

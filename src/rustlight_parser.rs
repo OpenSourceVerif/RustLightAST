@@ -7,7 +7,7 @@ pub use syn::Error as ParseError;
 
 mod pattern;
 
-pub use pattern::parse_rust_pattern;
+pub use pattern::{convert_pattern, parse_rust_pattern};
 
 use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 use syn::{
@@ -151,7 +151,11 @@ pub fn convert_file_preserving_items(file: &File, module_name: String) -> RustMo
     )
 }
 
-fn file_module(file: &File, module_name: String, items: impl IntoIterator<Item = Item>) -> RustModule {
+fn file_module(
+    file: &File,
+    module_name: String,
+    items: impl IntoIterator<Item = Item>,
+) -> RustModule {
     RustModule {
         name: module_name,
         docs: Vec::new(),
@@ -279,13 +283,11 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .collect::<syn::Result<Vec<_>>>()?;
             Ok(Item::Impl(block))
         }
-        SynItem::Mod(item_mod) if item_mod.content.is_none() => {
-            Ok(Item::ModuleDecl(ModuleDecl {
-                name: item_mod.ident.to_string(),
-                vis: convert_visibility(&item_mod.vis),
-                attrs: item_mod.attrs.iter().map(attribute_to_raw_source).collect(),
-            }))
-        }
+        SynItem::Mod(item_mod) if item_mod.content.is_none() => Ok(Item::ModuleDecl(ModuleDecl {
+            name: item_mod.ident.to_string(),
+            vis: convert_visibility(&item_mod.vis),
+            attrs: item_mod.attrs.iter().map(attribute_to_raw_source).collect(),
+        })),
         SynItem::Mod(item_mod) => {
             let nested_items = item_mod
                 .content
@@ -483,7 +485,10 @@ pub fn convert_type(ty: &SynType) -> syn::Result<Type> {
             convert_type_path(&type_path.path)
         }
         SynType::Reference(TypeReference {
-            elem, lifetime, mutability, ..
+            elem,
+            lifetime,
+            mutability,
+            ..
         }) => Ok(Type::Reference(
             Box::new(convert_type(elem)?),
             lifetime.as_ref().map(ToString::to_string),
@@ -585,7 +590,10 @@ fn convert_callable_trait_bounds<'a>(
                 };
                 if matches!(last.arguments, PathArguments::Parenthesized(_)) {
                     if signature.replace(trait_bound).is_some() {
-                        return Err(syn::Error::new_spanned(bound, "multiple callable trait bounds"));
+                        return Err(syn::Error::new_spanned(
+                            bound,
+                            "multiple callable trait bounds",
+                        ));
                     }
                     continue;
                 }
@@ -595,12 +603,20 @@ fn convert_callable_trait_bounds<'a>(
                     || !last.arguments.is_none()
                     || !is_native_callable_bound_path(path, "clone", "Clone")
                 {
-                    return Err(syn::Error::new_spanned(bound, "unsupported callable trait bound"));
+                    return Err(syn::Error::new_spanned(
+                        bound,
+                        "unsupported callable trait bound",
+                    ));
                 }
                 clone = true;
                 CallableBound::Trait(bound_path_segments(path, path.segments.len()))
             }
-            _ => return Err(syn::Error::new_spanned(bound, "unsupported callable trait bound")),
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    bound,
+                    "unsupported callable trait bound",
+                ))
+            }
         };
         if signature.is_some() {
             trailing_bounds.push(additional);
@@ -742,7 +758,11 @@ fn convert_type_path(path: &syn::Path) -> syn::Result<Type> {
         .leading_colon
         .iter()
         .map(|_| String::new())
-        .chain(path.segments.iter().map(|segment| segment.ident.to_string()))
+        .chain(
+            path.segments
+                .iter()
+                .map(|segment| segment.ident.to_string()),
+        )
         .collect();
     if !generic_args.is_empty() {
         Ok(Type::Generic(segments.join("::"), generic_args))
@@ -973,7 +993,9 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         }
         syn::Expr::Loop(expr) => Ok(Expr::Loop(
             Box::new(convert_block(&expr.body)?),
-            expr.label.as_ref().map(|label| label.name.ident.to_string()),
+            expr.label
+                .as_ref()
+                .map(|label| label.name.ident.to_string()),
         )),
         syn::Expr::While(expr) => {
             let condition = match expr.cond.as_ref() {
@@ -984,23 +1006,38 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 condition => convert_expr(condition)?,
             };
             Ok(Expr::While {
-                label: expr.label.as_ref().map(|label| label.name.ident.to_string()),
+                label: expr
+                    .label
+                    .as_ref()
+                    .map(|label| label.name.ident.to_string()),
                 condition: Box::new(condition),
                 body: convert_block(&expr.body)?,
             })
         }
         syn::Expr::ForLoop(expr) => Ok(Expr::For {
-            label: expr.label.as_ref().map(|label| label.name.ident.to_string()),
+            label: expr
+                .label
+                .as_ref()
+                .map(|label| label.name.ident.to_string()),
             pattern: pattern::convert_pattern(&expr.pat)?,
             iter: Box::new(convert_expr(&expr.expr)?),
             body: convert_block(&expr.body)?,
         }),
         syn::Expr::Return(expr) => Ok(Expr::Return(
-            expr.expr.as_deref().map(convert_expr).transpose()?.map(Box::new),
+            expr.expr
+                .as_deref()
+                .map(convert_expr)
+                .transpose()?
+                .map(Box::new),
         )),
         syn::Expr::Break(expr) => Ok(Expr::Break {
             label: expr.label.as_ref().map(|label| label.ident.to_string()),
-            value: expr.expr.as_deref().map(convert_expr).transpose()?.map(Box::new),
+            value: expr
+                .expr
+                .as_deref()
+                .map(convert_expr)
+                .transpose()?
+                .map(Box::new),
         }),
         syn::Expr::Continue(expr) => Ok(Expr::Continue(
             expr.label.as_ref().map(|label| label.ident.to_string()),
@@ -1034,15 +1071,19 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         }),
         syn::Expr::Range(expr) => {
             let bound = |bound: Option<&syn::Expr>| {
-                bound.map(|bound| convert_expr(bound).map(Box::new)).transpose()
+                bound
+                    .map(|bound| convert_expr(bound).map(Box::new))
+                    .transpose()
             };
             let start = bound(expr.start.as_deref())?;
             let end = bound(expr.end.as_deref())?;
             let end = match expr.limits {
                 syn::RangeLimits::HalfOpen(_) => crate::RangeEnd::Exclusive(end),
-                syn::RangeLimits::Closed(_) => crate::RangeEnd::Inclusive(end.ok_or_else(|| {
-                    syn::Error::new_spanned(expr, "inclusive range requires an end expression")
-                })?),
+                syn::RangeLimits::Closed(_) => {
+                    crate::RangeEnd::Inclusive(end.ok_or_else(|| {
+                        syn::Error::new_spanned(expr, "inclusive range requires an end expression")
+                    })?)
+                }
             };
             Ok(Expr::Range { start, end })
         }
@@ -1200,6 +1241,11 @@ fn convert_match_arm(arm: &syn::Arm) -> syn::Result<MatchArm> {
             .map(|(_, expr)| convert_expr(expr))
             .transpose()?,
         body: expr_to_block(&arm.body)?,
+        braced: matches!(
+            arm.body.as_ref(),
+            syn::Expr::Block(ExprBlock { label: None, .. })
+        ),
+        comma: arm.comma.is_some(),
     })
 }
 
@@ -1818,7 +1864,7 @@ pub fn value() -> u64 {
 pub struct Word<W>(pub u128, pub std::marker::PhantomData<W>);
 impl<W> Copy for Word<W> {}
 impl<W> Clone for Word<W> { fn clone(&self) -> Self { *self } }
-pub fn unsupported() { let Some(_) = None::<u8> else { return; }; }
+pub fn unsupported() { const { () }; }
 "#;
         assert!(parse_rust_source(source, "Facts_Test").is_err());
         let facts = parse_rust_type_facts(source, "Facts_Test").expect("facts parse");
