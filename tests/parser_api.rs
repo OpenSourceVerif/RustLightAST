@@ -501,3 +501,27 @@ fn async_blocks_keep_capture_mode_and_body() {
     assert!(printed.contains("value.into_bytes()"));
     parse_rust_source(&printed, "roundtrip").unwrap();
 }
+
+#[test]
+fn adding_a_derive_keeps_existing_names_in_their_attribute_groups() {
+    use quote::ToTokens;
+    use rustlightast::DataAttribute;
+
+    let source = "#[derive(Clone)] #[repr(C)] #[derive(Debug,)] #[allow(dead_code)] struct S;";
+    let mut module = parse_rust_source(source, "derive_order").unwrap();
+    let Item::Struct(item) = &mut module.items[0] else {
+        panic!("expected structure");
+    };
+    DataAttribute::push_derive(&mut item.attrs, "Copy".to_owned());
+
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    let actual = syn::parse_str::<syn::ItemStruct>(&printed).unwrap();
+    let expected = syn::parse_str::<syn::ItemStruct>(
+        "#[derive(Clone)] #[repr(C)] #[derive(Debug, Copy,)] #[allow(dead_code)] struct S;",
+    )
+    .unwrap();
+    assert_eq!(
+        actual.to_token_stream().to_string(),
+        expected.to_token_stream().to_string(),
+    );
+}

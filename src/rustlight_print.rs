@@ -272,64 +272,64 @@ impl RustCodeGenerator {
         for doc in &s.docs {
             self.writeln(doc);
         }
+        self.generate_data_attributes(&s.attrs);
 
-        // Derive attributes
-        if !s.derives.is_empty() {
-            self.write("#[derive(");
-            for (i, derive) in s.derives.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
-                self.write(derive);
-            }
-            self.writeln(")]");
-        }
-
-        let tuple_struct =
-            !s.fields.is_empty() && s.fields.iter().all(|field| field.name.is_empty());
-
-        // Struct definition
         self.write(&format!("{}struct {} ", self.visibility(&s.vis), s.name));
-
         self.write(&self.generic_params_to_string(&s.generics.params));
 
-        if tuple_struct {
-            self.write("(");
-            for (i, field) in s.fields.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
-                self.write(&self.visibility(&field.vis));
-                self.write(&self.type_to_string(&field.ty));
+        match &s.fields {
+            Fields::Unit => {
+                self.write_where_predicates(&s.generics.where_predicates);
+                self.writeln(";");
             }
-            self.write(")");
-            self.write_where_predicates(&s.generics.where_predicates);
-            self.writeln(";");
-            self.writeln("");
-            return;
+            Fields::Tuple(fields) => {
+                self.generate_tuple_fields(fields);
+                self.write_where_predicates(&s.generics.where_predicates);
+                self.writeln(";");
+            }
+            Fields::Named(fields) => {
+                self.write_where_predicates(&s.generics.where_predicates);
+                self.generate_named_fields(fields);
+                self.writeln("");
+            }
         }
-
-        self.write_where_predicates(&s.generics.where_predicates);
-        self.writeln(" {");
-
-        self.indent();
-
-        for field in &s.fields {
-            self.generate_field(field);
-        }
-
-        self.dedent();
-        self.writeln("}");
         self.writeln("");
     }
 
-    fn generate_field(&mut self, field: &Field) {
+    fn generate_tuple_fields(&mut self, fields: &[Field]) {
+        self.write("(");
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                self.write(", ");
+            }
+            self.generate_field_metadata(field);
+            self.write(&self.visibility(&field.vis));
+            self.write(&self.type_to_string(&field.ty));
+        }
+        self.write(")");
+    }
+
+    fn generate_named_fields(&mut self, fields: &[Field]) {
+        self.writeln(" {");
+        self.indent();
+        for field in fields {
+            self.generate_field(field);
+        }
+        self.dedent();
+        self.write("}");
+    }
+
+    fn generate_field_metadata(&mut self, field: &Field) {
         for doc in &field.docs {
             self.writeln(doc);
         }
         for attr in &field.attrs {
             self.generate_attribute(attr);
         }
+    }
+
+    fn generate_field(&mut self, field: &Field) {
+        self.generate_field_metadata(field);
         self.writeln(&format!(
             "{}{}: {},",
             self.visibility(&field.vis),
@@ -379,10 +379,7 @@ impl RustCodeGenerator {
             self.writeln(doc);
         }
 
-        // Attributes
-        for attr in &f.attrs {
-            self.generate_attribute(attr);
-        }
+        self.generate_attributes(&f.attrs, false);
 
         let head = format!(
             "{}{}fn {}{}",
@@ -429,6 +426,7 @@ impl RustCodeGenerator {
         }
 
         self.indent();
+        self.generate_attributes(&f.attrs, true);
         self.generate_block(&f.body);
         self.dedent();
         self.writeln("}");
@@ -1257,17 +1255,7 @@ impl RustCodeGenerator {
         for doc in &e.docs {
             self.writeln(doc);
         }
-
-        if !e.derives.is_empty() {
-            self.write("#[derive(");
-            for (i, derive) in e.derives.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
-                self.write(derive);
-            }
-            self.writeln(")]");
-        }
+        self.generate_data_attributes(&e.attrs);
 
         self.write(&format!("{}enum {} ", self.visibility(&e.vis), e.name));
 
@@ -1277,19 +1265,18 @@ impl RustCodeGenerator {
 
         self.indent();
         for variant in &e.variants {
-            for doc in &variant.docs {
-                self.writeln(doc);
+            for attr in &variant.attrs {
+                self.writeln(attr);
             }
             self.write(&variant.name);
-            if let Some(types) = &variant.data {
-                self.write("(");
-                for (i, ty) in types.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.write(&self.type_to_string(ty));
-                }
-                self.write(")");
+            match &variant.fields {
+                Fields::Unit => {}
+                Fields::Tuple(fields) => self.generate_tuple_fields(fields),
+                Fields::Named(fields) => self.generate_named_fields(fields),
+            }
+            if let Some(discriminant) = &variant.discriminant {
+                self.write(" = ");
+                self.generate_expr(discriminant);
             }
             self.writeln(",");
         }
@@ -1333,11 +1320,44 @@ impl RustCodeGenerator {
         }
     }
 
+    fn generate_data_attributes(&mut self, attrs: &[DataAttribute]) {
+        for attr in attrs {
+            match attr {
+                DataAttribute::Other(attr) => self.generate_attribute(attr),
+                DataAttribute::Derive {
+                    names,
+                    trailing_comma,
+                } => {
+                    let suffix = if *trailing_comma && !names.is_empty() {
+                        ","
+                    } else {
+                        ""
+                    };
+                    self.writeln(&format!("#[derive({}{suffix})]", names.join(", ")));
+                }
+            }
+        }
+    }
+
+    fn generate_attributes(&mut self, attrs: &[Attribute], inner: bool) {
+        for attr in attrs.iter().filter(|attr| attr.is_inner() == inner) {
+            self.generate_attribute(attr);
+        }
+    }
+
     fn generate_attribute(&mut self, attr: &Attribute) {
-        self.write(&format!("#[{}", attr.name));
-        if !attr.args.is_empty() {
+        let (name, args) = match attr {
+            Attribute::Source { meta, inner } => {
+                let marker = if *inner { "#!" } else { "#" };
+                self.writeln(&format!("{marker}[{meta}]"));
+                return;
+            }
+            Attribute::Structured { name, args } => (name, args),
+        };
+        self.write(&format!("#[{name}"));
+        if !args.is_empty() {
             self.write("(");
-            for (i, arg) in attr.args.iter().enumerate() {
+            for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
                     self.write(", ");
                 }
@@ -1505,18 +1525,7 @@ impl RustCodeGenerator {
         for doc in &u.docs {
             self.writeln(doc);
         }
-
-        // Derive attributes
-        if !u.derives.is_empty() {
-            self.write("#[derive(");
-            for (i, derive) in u.derives.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
-                self.write(derive);
-            }
-            self.writeln(")]");
-        }
+        self.generate_data_attributes(&u.attrs);
 
         // Union definition
         self.write(&format!("{}union {} ", self.visibility(&u.vis), u.name));

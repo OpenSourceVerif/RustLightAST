@@ -23,11 +23,12 @@ use syn::{
 #[cfg(test)]
 use crate::RustCodeGenerator;
 use crate::{
-    AssociatedTypeBinding, Attribute, AttributeArg, Block, CallableBound, CallableTraitQualifier,
-    CallableTraitType, ClosureParam, ConstDef, EnumDef, Expr, Field, FunctionDef, GenericParam,
-    Generics, ImplBlock, ImplItem, Item, LetStmt, LifetimeParameter, Literal, MatchArm, Member,
-    ModuleDecl, Param, PathType, RecordField, RecordPath, RustModule, Statement, StructDef, Type,
-    TypeAlias, TypeParameter, UnionDef, UseKind, UseStatement, Variant, Visibility, WherePredicate,
+    AssociatedTypeBinding, Attribute, Block, CallableBound, CallableTraitQualifier,
+    CallableTraitType, ClosureParam, ConstDef, EnumDef, Expr, Field, FunctionDef,
+    GenericParam, Generics, ImplBlock, ImplItem, Item, LetStmt,
+    LifetimeParameter, Literal, MatchArm, Member, ModuleDecl, Param, PathType, RecordField,
+    RecordPath, RustModule, Statement, StructDef, Type, TypeAlias, TypeParameter, UnionDef,
+    UseKind, UseStatement, Variant, Visibility, WherePredicate,
 };
 
 /// Marker attached to recovered function signatures with synthetic empty bodies.
@@ -196,7 +197,7 @@ pub fn convert_inline_module(module: &syn::ItemMod, mut items: Vec<Item>) -> Rus
 
     RustModule {
         name: module.ident.to_string(),
-        docs: extract_docs(&outer),
+        docs: Vec::new(),
         items,
         attrs: convert_attributes(&outer),
         vis: convert_visibility(&module.vis),
@@ -214,8 +215,8 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .map(convert_variant)
                 .collect::<syn::Result<Vec<_>>>()?,
             generics: convert_generics(&item_enum.generics)?,
-            derives: extract_derives(&item_enum.attrs),
-            docs: extract_docs(&item_enum.attrs),
+            docs: Vec::new(),
+            attrs: convert_data_attributes(&item_enum.attrs),
             vis: convert_visibility(&item_enum.vis),
         })),
         SynItem::Fn(item_fn) => Ok(Item::Function(FunctionDef {
@@ -231,19 +232,15 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
             body: convert_block(&item_fn.block)?,
             asyncness: item_fn.sig.asyncness.is_some(),
             vis: convert_visibility(&item_fn.vis),
-            docs: extract_docs(&item_fn.attrs),
+            docs: Vec::new(),
             attrs: convert_attributes(&item_fn.attrs),
         })),
         SynItem::Struct(item_struct) => Ok(Item::Struct(StructDef {
             name: item_struct.ident.to_string(),
-            fields: item_struct
-                .fields
-                .iter()
-                .map(convert_field)
-                .collect::<syn::Result<Vec<_>>>()?,
+            fields: convert_fields(&item_struct.fields)?,
             generics: convert_generics(&item_struct.generics)?,
-            derives: extract_derives(&item_struct.attrs),
-            docs: extract_docs(&item_struct.attrs),
+            docs: Vec::new(),
+            attrs: convert_data_attributes(&item_struct.attrs),
             vis: convert_visibility(&item_struct.vis),
         })),
         SynItem::Union(item_union) => Ok(Item::Union(UnionDef {
@@ -255,8 +252,8 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
                 .map(convert_field)
                 .collect::<syn::Result<Vec<_>>>()?,
             generics: convert_generics(&item_union.generics)?,
-            derives: extract_derives(&item_union.attrs),
-            docs: extract_docs(&item_union.attrs),
+            docs: Vec::new(),
+            attrs: convert_data_attributes(&item_union.attrs),
             vis: convert_visibility(&item_union.vis),
         })),
         SynItem::Type(item_type) => Ok(Item::TypeAlias(TypeAlias {
@@ -311,28 +308,27 @@ pub fn convert_item(item: &SynItem) -> syn::Result<Item> {
 }
 
 fn convert_variant(variant: &syn::Variant) -> syn::Result<Variant> {
-    let data = match &variant.fields {
-        syn::Fields::Unit => None,
-        syn::Fields::Unnamed(fields) => Some(
-            fields
-                .unnamed
-                .iter()
-                .map(|field| convert_type(&field.ty))
-                .collect::<syn::Result<Vec<_>>>()?,
-        ),
-        syn::Fields::Named(fields) => Some(
-            fields
-                .named
-                .iter()
-                .map(|field| convert_type(&field.ty))
-                .collect::<syn::Result<Vec<_>>>()?,
-        ),
-    };
-
     Ok(Variant {
         name: variant.ident.to_string(),
-        data,
-        docs: extract_docs(&variant.attrs),
+        fields: convert_fields(&variant.fields)?,
+        discriminant: variant
+            .discriminant
+            .as_ref()
+            .map(|(_, value)| convert_expr(value))
+            .transpose()?,
+        attrs: variant.attrs.iter().map(attribute_to_raw_source).collect(),
+    })
+}
+
+fn convert_fields(fields: &syn::Fields) -> syn::Result<crate::Fields> {
+    let converted = fields
+        .iter()
+        .map(convert_field)
+        .collect::<syn::Result<Vec<_>>>()?;
+    Ok(match fields {
+        syn::Fields::Unit => crate::Fields::Unit,
+        syn::Fields::Unnamed(_) => crate::Fields::Tuple(converted),
+        syn::Fields::Named(_) => crate::Fields::Named(converted),
     })
 }
 
@@ -408,7 +404,7 @@ fn convert_impl_item(item: &SynImplItem) -> syn::Result<ImplItem> {
             body: convert_block(&method.block)?,
             asyncness: method.sig.asyncness.is_some(),
             vis: convert_visibility(&method.vis),
-            docs: extract_docs(&method.attrs),
+            docs: Vec::new(),
             attrs: convert_attributes(&method.attrs),
         })),
         SynImplItem::Const(item_const) => Ok(ImplItem::AssocConst(
@@ -1521,55 +1517,37 @@ pub fn attribute_to_raw_source(attr: &syn::Attribute) -> String {
         syn::AttrStyle::Outer => "#",
     };
 
-    match &attr.meta {
-        Meta::Path(path) => format!("{marker}[{}]", normalize_tokens(path.to_token_stream())),
-        Meta::NameValue(name_value) => format!(
-            "{marker}[{} = {}]",
-            normalize_tokens(name_value.path.to_token_stream()),
-            normalize_tokens(name_value.value.to_token_stream())
-        ),
-        Meta::List(list) => format!(
-            "{marker}[{}({})]",
-            normalize_tokens(list.path.to_token_stream()),
-            normalize_tokens(list.tokens.clone())
-        ),
-    }
+    format!("{marker}[{}]", attr.meta.to_token_stream())
 }
 
 /// Convert attributes represented by RustLightAST items.
 pub fn convert_attributes(attrs: &[syn::Attribute]) -> Vec<Attribute> {
-    attrs.iter().filter_map(convert_attribute).collect()
+    attrs.iter().map(convert_attribute).collect()
 }
 
-fn convert_attribute(attr: &syn::Attribute) -> Option<Attribute> {
-    if attr.path().is_ident("doc") || attr.path().is_ident("derive") {
-        return None;
-    }
-
-    let args = match &attr.meta {
-        Meta::Path(_) => Vec::new(),
-        Meta::NameValue(name_value) => vec![AttributeArg::KeyValue(
-            name_value.path.to_token_stream().to_string(),
-            convert_literal_from_expr(&name_value.value)?,
-        )],
-        Meta::List(list) => normalize_tokens(list.tokens.clone())
-            .split(',')
-            .filter(|part| !part.trim().is_empty())
-            .map(|part| AttributeArg::Ident(part.trim().to_string()))
-            .collect(),
-    };
-
-    Some(Attribute {
-        name: normalize_tokens(attr.path().to_token_stream()),
-        args,
-    })
+fn convert_data_attributes(attrs: &[syn::Attribute]) -> Vec<crate::DataAttribute> {
+    attrs
+        .iter()
+        .map(|attr| {
+            if let Some(paths) = derive_paths(attr) {
+                crate::DataAttribute::Derive {
+                    trailing_comma: paths.trailing_punct(),
+                    names: paths
+                        .into_iter()
+                        .map(|path| normalize_tokens(path.to_token_stream()))
+                        .collect(),
+                }
+            } else {
+                crate::DataAttribute::Other(convert_attribute(attr))
+            }
+        })
+        .collect()
 }
 
-fn convert_literal_from_expr(expr: &syn::Expr) -> Option<Literal> {
-    if let syn::Expr::Lit(ExprLit { lit, .. }) = expr {
-        convert_literal(lit).ok()
-    } else {
-        None
+fn convert_attribute(attr: &syn::Attribute) -> Attribute {
+    Attribute::Source {
+        meta: attr.meta.to_token_stream().to_string(),
+        inner: matches!(attr.style, syn::AttrStyle::Inner(_)),
     }
 }
 
@@ -1599,19 +1577,17 @@ pub fn extract_docs(attrs: &[syn::Attribute]) -> Vec<String> {
         .collect()
 }
 
-fn extract_derives(attrs: &[syn::Attribute]) -> Vec<String> {
-    attrs
-        .iter()
-        .filter(|attr| attr.path().is_ident("derive"))
-        .flat_map(|attr| match &attr.meta {
-            Meta::List(list) => normalize_tokens(list.tokens.clone())
-                .split(',')
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-                .collect::<Vec<_>>(),
-            _ => Vec::new(),
-        })
-        .collect()
+fn derive_paths(
+    attr: &syn::Attribute,
+) -> Option<syn::punctuated::Punctuated<syn::Path, syn::Token![,]>> {
+    let Meta::List(list) = &attr.meta else {
+        return None;
+    };
+    if !list.path.is_ident("derive") || !matches!(list.delimiter, syn::MacroDelimiter::Paren(_)) {
+        return None;
+    }
+    list.parse_args_with(syn::punctuated::Punctuated::parse_terminated)
+        .ok()
 }
 
 fn normalize_tokens(tokens: TokenStream) -> String {
@@ -1748,8 +1724,11 @@ pub fn get(x0: Option) -> Int {
             Item::Enum(def) => {
                 assert_eq!(def.name, "Num");
                 assert_eq!(def.variants.len(), 3);
-                assert_eq!(def.derives, vec!["Clone"]);
-                match &def.variants[1].data.as_ref().expect("tuple variant")[0] {
+                assert!(crate::DataAttribute::derive_names(&def.attrs).eq(["Clone"]));
+                let crate::Fields::Tuple(fields) = &def.variants[1].fields else {
+                    panic!("expected tuple variant");
+                };
+                match &fields[0].ty {
                     Type::Generic(name, params) => {
                         assert_eq!(name, "Box");
                         assert_eq!(params.len(), 1);

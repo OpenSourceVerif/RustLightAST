@@ -37,10 +37,10 @@ pub enum Item {
 /// Struct definition
 #[derive(Debug, Clone)]
 pub struct StructDef {
+    pub attrs: Vec<DataAttribute>,
     pub name: String,
-    pub fields: Vec<Field>,
+    pub fields: Fields,
     pub generics: Generics,
-    pub derives: Vec<String>, // #[derive(...)]
     pub docs: Vec<String>,
     pub vis: Visibility, // controls struct visibility
 }
@@ -48,10 +48,10 @@ pub struct StructDef {
 /// Union definition
 #[derive(Debug, Clone)]
 pub struct UnionDef {
+    pub attrs: Vec<DataAttribute>,
     pub name: String,
     pub fields: Vec<Field>, // union fields
     pub generics: Generics,
-    pub derives: Vec<String>, // #[derive(...)]
     pub docs: Vec<String>,
     pub vis: Visibility, // controls union visibility
 }
@@ -59,10 +59,10 @@ pub struct UnionDef {
 /// Enum definition
 #[derive(Debug, Clone)]
 pub struct EnumDef {
+    pub attrs: Vec<DataAttribute>,
     pub name: String,
     pub variants: Vec<Variant>,
     pub generics: Generics,
-    pub derives: Vec<String>,
     pub docs: Vec<String>,
     pub vis: Visibility,
 }
@@ -481,9 +481,66 @@ pub enum Visibility {
 }
 
 #[derive(Debug, Clone)]
-pub struct Attribute {
-    pub name: String,
-    pub args: Vec<AttributeArg>,
+pub enum Attribute {
+    Structured {
+        name: String,
+        args: Vec<AttributeArg>,
+    },
+    /// A parsed Rust attribute with its original token structure.
+    Source { meta: String, inner: bool },
+}
+
+impl Attribute {
+    pub fn is_inner(&self) -> bool {
+        matches!(self, Self::Source { inner: true, .. })
+    }
+
+    pub fn is_doc(&self) -> bool {
+        match self {
+            Self::Structured { name, .. } => name == "doc",
+            Self::Source { meta, .. } => meta.strip_prefix("doc").is_some_and(|tail| {
+                let tail = tail.trim_start();
+                tail.is_empty() || tail.starts_with(['=', '(', '[', '{'])
+            }),
+        }
+    }
+}
+
+/// Attributes on a data declaration, in source order.
+#[derive(Debug, Clone)]
+pub enum DataAttribute {
+    Derive {
+        names: Vec<String>,
+        trailing_comma: bool,
+    },
+    Other(Attribute),
+}
+
+impl DataAttribute {
+    pub fn derive_names(attrs: &[Self]) -> impl Iterator<Item = &str> {
+        attrs
+            .iter()
+            .flat_map(|attr| match attr {
+                Self::Derive { names, .. } => names.as_slice(),
+                Self::Other(_) => &[],
+            })
+            .map(String::as_str)
+    }
+
+    /// Append a name to the last derive attribute, creating a group if needed.
+    pub fn push_derive(attrs: &mut Vec<Self>, name: String) {
+        if let Some(names) = attrs.iter_mut().rev().find_map(|attr| match attr {
+            Self::Derive { names, .. } => Some(names),
+            Self::Other(_) => None,
+        }) {
+            names.push(name);
+        } else {
+            attrs.push(Self::Derive {
+                names: vec![name],
+                trailing_comma: false,
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -502,11 +559,38 @@ pub struct Field {
     pub attrs: Vec<Attribute>,
 }
 
+/// Field forms shared by structures and enum variants. Empty tuple and
+/// record constructors retain their syntax independently of unit constructors.
+#[derive(Debug, Clone)]
+pub enum Fields {
+    Unit,
+    Tuple(Vec<Field>),
+    Named(Vec<Field>),
+}
+
+impl Fields {
+    pub fn as_slice(&self) -> &[Field] {
+        match self {
+            Self::Unit => &[],
+            Self::Tuple(fields) | Self::Named(fields) => fields,
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [Field] {
+        match self {
+            Self::Unit => &mut [],
+            Self::Tuple(fields) | Self::Named(fields) => fields,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Variant {
     pub name: String,
-    pub data: Option<Vec<Type>>, // Some for tuple variant
-    pub docs: Vec<String>,
+    pub fields: Fields,
+    pub discriminant: Option<Expr>,
+    /// Outer attributes, including doc attributes, in declaration order.
+    pub attrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
