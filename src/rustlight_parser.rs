@@ -835,7 +835,6 @@ fn can_model_local_function(function: &syn::ItemFn) -> bool {
                 syn::GenericParam::Type(parameter) => parameter.default.is_none(),
                 syn::GenericParam::Lifetime(_) => true,
                 syn::GenericParam::Const(_) => false,
-            ensure_unlabeled(expr.label.as_ref())?;
             };
             visit::visit_generic_param(self, parameter);
         }
@@ -953,13 +952,19 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 .collect::<syn::Result<Vec<_>>>()?,
         }),
         syn::Expr::Block(ExprBlock { label, block, .. }) => {
-            ensure_unlabeled(label.as_ref())?;
-            Ok(Expr::Block(convert_block(block)?))
+            let body = convert_block(block)?;
+            Ok(match label {
+                Some(label) => Expr::LabeledBlock {
+                    label: label.name.ident.to_string(),
+                    body,
+                },
+                None => Expr::Block(body),
+            })
         }
-        syn::Expr::Loop(expr) => {
-            ensure_unlabeled(expr.label.as_ref())?;
-            Ok(Expr::Loop(Box::new(convert_block(&expr.body)?)))
-        }
+        syn::Expr::Loop(expr) => Ok(Expr::Loop(
+            Box::new(convert_block(&expr.body)?),
+            expr.label.as_ref().map(|label| label.name.ident.to_string()),
+        )),
         syn::Expr::While(expr) => {
             let condition = match expr.cond.as_ref() {
                 syn::Expr::Let(condition) => Expr::Let {
@@ -969,31 +974,27 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 condition => convert_expr(condition)?,
             };
             Ok(Expr::While {
+                label: expr.label.as_ref().map(|label| label.name.ident.to_string()),
                 condition: Box::new(condition),
                 body: convert_block(&expr.body)?,
             })
         }
-        syn::Expr::ForLoop(expr) => {
-            ensure_unlabeled(expr.label.as_ref())?;
-            Ok(Expr::For {
-                pattern: pattern::convert_pattern(&expr.pat)?,
-                iter: Box::new(convert_expr(&expr.expr)?),
-                body: convert_block(&expr.body)?,
-            })
-        }
+        syn::Expr::ForLoop(expr) => Ok(Expr::For {
+            label: expr.label.as_ref().map(|label| label.name.ident.to_string()),
+            pattern: pattern::convert_pattern(&expr.pat)?,
+            iter: Box::new(convert_expr(&expr.expr)?),
+            body: convert_block(&expr.body)?,
+        }),
         syn::Expr::Return(expr) => Ok(Expr::Return(
             expr.expr.as_deref().map(convert_expr).transpose()?.map(Box::new),
         )),
-        syn::Expr::Break(expr) => {
-            ensure_unlabeled(expr.label.as_ref())?;
-            Ok(Expr::Break(
-                expr.expr.as_deref().map(convert_expr).transpose()?.map(Box::new),
-            ))
-        }
-        syn::Expr::Continue(expr) => {
-            ensure_unlabeled(expr.label.as_ref())?;
-            Ok(Expr::Continue)
-        }
+        syn::Expr::Break(expr) => Ok(Expr::Break {
+            label: expr.label.as_ref().map(|label| label.ident.to_string()),
+            value: expr.expr.as_deref().map(convert_expr).transpose()?.map(Box::new),
+        }),
+        syn::Expr::Continue(expr) => Ok(Expr::Continue(
+            expr.label.as_ref().map(|label| label.ident.to_string()),
+        )),
         syn::Expr::Reference(ExprReference {
             expr, mutability, ..
         }) => Ok(Expr::Reference(
@@ -1003,6 +1004,18 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         )),
         syn::Expr::Cast(ExprCast { expr, ty, .. }) => {
             Ok(Expr::Cast(Box::new(convert_expr(expr)?), convert_type(ty)?))
+        }
+        syn::Expr::Async(expr) => {
+            if !expr.attrs.is_empty() {
+                return Err(syn::Error::new_spanned(
+                    expr,
+                    "unsupported async block attributes",
+                ));
+            }
+            Ok(Expr::Async {
+                body: convert_block(&expr.block)?,
+                move_capture: expr.capture.is_some(),
+            })
         }
         syn::Expr::Try(expr) => Ok(Expr::Try(Box::new(convert_expr(&expr.expr)?))),
         syn::Expr::Repeat(expr) => Ok(Expr::Repeat {
@@ -1142,13 +1155,6 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
     }
 }
 
-fn ensure_unlabeled(label: Option<&impl quote::ToTokens>) -> syn::Result<()> {
-    match label {
-        Some(label) => Err(syn::Error::new_spanned(label, "unsupported expression label")),
-        None => Ok(()),
-    }
-}
-
 fn convert_closure_param(pattern: &syn::Pat) -> syn::Result<ClosureParam> {
     match pattern {
         syn::Pat::Type(typed) => Ok(ClosureParam::typed(
@@ -1163,10 +1169,7 @@ fn convert_closure_param(pattern: &syn::Pat) -> syn::Result<ClosureParam> {
 
 fn expr_to_block(expr: &syn::Expr) -> syn::Result<Block> {
     match expr {
-        syn::Expr::Block(ExprBlock { label, block, .. }) => {
-            ensure_unlabeled(label.as_ref())?;
-            convert_block(block)
-        }
+        syn::Expr::Block(ExprBlock { label: None, block, .. }) => convert_block(block),
         syn::Expr::If(expr_if) => Ok(Block {
             stmts: Vec::new(),
             expr: Some(Box::new(convert_expr(&syn::Expr::If(expr_if.clone()))?)),

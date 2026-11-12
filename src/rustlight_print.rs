@@ -562,21 +562,21 @@ impl RustCodeGenerator {
                 }
                 self.write(")");
             }
-            Expr::Block(block) => {
-                self.writeln("{");
-                self.indent();
-                self.generate_block(block);
-                self.dedent();
-                self.write("}");
+            Expr::Block(block) => self.generate_braced_block(block),
+            Expr::LabeledBlock { label, body } => {
+                self.generate_label(Some(label));
+                self.generate_braced_block(body);
             }
-            Expr::Loop(block) => {
+            Expr::Loop(block, label) => {
+                self.generate_label(label.as_deref());
                 self.writeln("loop {");
                 self.indent();
                 self.generate_block(block);
                 self.dedent();
                 self.write("}");
             }
-            Expr::While { condition, body } => {
+            Expr::While { label, condition, body } => {
+                self.generate_label(label.as_deref());
                 self.write("while ");
                 self.generate_expr(condition);
                 self.writeln(" {");
@@ -591,6 +591,7 @@ impl RustCodeGenerator {
                 iter,
                 body,
             } => {
+                self.generate_label(label.as_deref());
                 self.write("for ");
                 self.generate_pattern(pattern);
                 self.write(" in ");
@@ -607,9 +608,15 @@ impl RustCodeGenerator {
                 self.write(" = ");
                 self.generate_expr(value);
             }
-            Expr::Return(value) => self.generate_jump_expr("return", value.as_deref()),
-            Expr::Break(value) => self.generate_jump_expr("break", value.as_deref()),
-            Expr::Continue => self.write("continue"),
+            Expr::Return(value) => self.generate_jump_expr("return", None, value.as_deref()),
+            Expr::Break { label, value } => {
+                self.generate_jump_expr("break", label.as_deref(), value.as_deref())
+            }
+            Expr::Continue(label) => self.generate_jump_expr("continue", label.as_deref(), None),
+            Expr::Async { body, move_capture } => {
+                self.write(if *move_capture { "async move " } else { "async " });
+                self.generate_braced_block(body);
+            }
             Expr::Await(expr) => {
                 self.generate_expr(expr);
                 self.write(".await");
@@ -837,7 +844,23 @@ impl RustCodeGenerator {
         }
     }
 
-    fn generate_jump_expr(&mut self, keyword: &str, value: Option<&Expr>) {
+    fn generate_braced_block(&mut self, block: &Block) {
+        self.writeln("{");
+        self.indent();
+        self.generate_block(block);
+        self.dedent();
+        self.write("}");
+    }
+
+    fn generate_label(&mut self, label: Option<&str>) {
+        if let Some(label) = label {
+            self.write("'");
+            self.write(label);
+            self.write(": ");
+        }
+    }
+
+    fn generate_jump_expr(&mut self, keyword: &str, label: Option<&str>, value: Option<&Expr>) {
         self.write(keyword);
         if let Some(label) = label {
             self.write(" '");
@@ -857,7 +880,7 @@ impl RustCodeGenerator {
                 | Expr::Closure(..)
                 | Expr::TypedClosure(..)
                 | Expr::Return(_)
-                | Expr::Break(_)
+                | Expr::Break { .. }
                 | Expr::Reference(..)
                 | Expr::UnaryOp(..)
                 | Expr::Range { .. }
@@ -1599,13 +1622,17 @@ mod tests {
     fn prints_while_loop() {
         let printed = print_function_body(
             Expr::While {
+                label: None,
                 condition: Box::new(Expr::BinaryOp(
                     Box::new(Expr::Ident("i".to_string())),
                     "<".to_string(),
                     Box::new(Expr::Literal(Literal::Int(10))),
                 )),
                 body: Block {
-                    stmts: vec![Statement::Expr(Expr::Break(None))],
+                    stmts: vec![Statement::Expr(Expr::Break {
+                        label: None,
+                        value: None,
+                    })],
                     expr: None,
                 },
             },
@@ -1631,7 +1658,7 @@ mod tests {
                     Expr::Literal(Literal::Int(3)),
                 ])),
                 body: Block {
-                    stmts: vec![Statement::Expr(Expr::Continue)],
+                    stmts: vec![Statement::Expr(Expr::Continue(None))],
                     expr: None,
                 },
             },

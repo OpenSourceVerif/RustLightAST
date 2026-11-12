@@ -99,12 +99,20 @@ impl<F: FnMut(&mut Expr) -> bool> Expressions<'_, F> {
                     self.expression(item);
                 }
             }
-            Expr::Block(block) => self.block(block),
-            Expr::Loop(block) | Expr::Unsafe(block) => self.block(block),
-            Expr::Let { value, .. } | Expr::Return(Some(value)) | Expr::Break(Some(value)) => {
+            Expr::Block(block)
+            | Expr::LabeledBlock { body: block, .. }
+            | Expr::Async { body: block, .. } => self.block(block),
+            Expr::Loop(block, _) | Expr::Unsafe(block) => self.block(block),
+            Expr::Let { value, .. }
+            | Expr::Return(Some(value))
+            | Expr::Break {
+                value: Some(value), ..
+            } => {
                 self.expression(value);
             }
-            Expr::While { condition, body } => {
+            Expr::While {
+                condition, body, ..
+            } => {
                 self.expression(condition);
                 self.block(body);
             }
@@ -169,8 +177,8 @@ impl<F: FnMut(&mut Expr) -> bool> Expressions<'_, F> {
             | Expr::Path(_, _)
             | Expr::Literal(_)
             | Expr::Return(None)
-            | Expr::Break(None)
-            | Expr::Continue => {}
+            | Expr::Break { value: None, .. }
+            | Expr::Continue(_) => {}
         }
     }
 }

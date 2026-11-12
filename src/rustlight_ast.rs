@@ -239,12 +239,18 @@ pub enum Expr {
     Call(Box<Expr>, Vec<Expr>),
     MethodCall(Box<Expr>, String, Vec<Expr>),
     Block(Block),
-    Loop(Box<Block>),
+    LabeledBlock {
+        label: String,
+        body: Block,
+    },
+    Loop(Box<Block>, Option<String>),
     While {
+        label: Option<String>,
         condition: Box<Expr>,
         body: Block,
     },
     For {
+        label: Option<String>,
         pattern: Pattern,
         iter: Box<Expr>,
         body: Block,
@@ -254,8 +260,15 @@ pub enum Expr {
         value: Box<Expr>,
     },
     Return(Option<Box<Expr>>),
-    Break(Option<Box<Expr>>),
-    Continue,
+    Break {
+        label: Option<String>,
+        value: Option<Box<Expr>>,
+    },
+    Continue(Option<String>),
+    Async {
+        body: Block,
+        move_capture: bool,
+    },
     Await(Box<Expr>),
     Try(Box<Expr>),
     /// `(params, body, is_move)` — third field is `true` for `move |…| …` closures.

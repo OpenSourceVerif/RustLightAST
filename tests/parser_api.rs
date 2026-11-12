@@ -195,22 +195,48 @@ fn total() -> u32 {
 }
 
 #[test]
-fn parser_rejects_labels_in_control_flow() {
-    for source in [
-        "fn f() { 'outer: loop { break 'outer; } }",
-        "fn f() { 'outer: while false {} }",
-        "fn f() { 'outer: for _ in [true] {} }",
-        "fn f() { 'outer: { break 'outer; } }",
-        "fn f() { loop { continue 'outer; } }",
-        "fn f() { loop { break 'outer; } }",
+fn loop_labels_roundtrip() {
+    let source = r#"
+fn f() -> u32 {
+    'outer: loop {
+        'repeat: while false { continue 'repeat; }
+        'items: for _ in [true] { break 'items; }
+        break 'outer 7;
+    }
+}
+"#;
+    let module = parse_rust_source(source, "labels").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    parse_rust_source(&printed, "roundtrip").unwrap();
+    for fragment in [
+        "'outer: loop",
+        "'repeat: while",
+        "'items: for",
+        "break 'items;",
+        "continue 'repeat;",
+        "break 'outer 7;",
     ] {
-        assert!(
-            parse_rust_source(source, "unsupported")
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported expression label"),
-            "{source}"
-        );
+        assert!(printed.contains(fragment), "{printed}");
+    }
+}
+
+#[test]
+fn labeled_block_preserves_break_and_tail_values() {
+    let source = r#"
+fn choose(early: bool) -> u32 {
+    match early {
+        value => 'answer: {
+            if value { break 'answer 3; }
+            7
+        },
+    }
+}
+"#;
+    let module = parse_rust_source(source, "label").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    parse_rust_source(&printed, "roundtrip").unwrap();
+    for fragment in ["'answer: {", "break 'answer 3;", "7\n"] {
+        assert!(printed.contains(fragment), "{printed}");
     }
 }
 
@@ -352,5 +378,24 @@ fn iterator_opaque_types_keep_the_associated_item_type() {
     let printed = RustCodeGenerator::new().generate_module_code(&module);
     assert!(printed.contains("impl IntoIterator<Item = T>"));
     assert!(printed.contains("impl Iterator<Item = &'a T>"));
+    parse_rust_source(&printed, "roundtrip").unwrap();
+}
+
+#[test]
+fn async_blocks_keep_capture_mode_and_body() {
+    let source = r#"
+        fn futures(value: String) {
+            let borrowed = async { value.len() };
+            drop(borrowed);
+            let moved = async move { value.into_bytes() };
+            drop(moved);
+        }
+    "#;
+    let module = parse_rust_source(source, "futures").unwrap();
+    let printed = RustCodeGenerator::new().generate_module_code(&module);
+    assert!(printed.contains("let borrowed = async {"));
+    assert!(printed.contains("value.len()"));
+    assert!(printed.contains("let moved = async move {"));
+    assert!(printed.contains("value.into_bytes()"));
     parse_rust_source(&printed, "roundtrip").unwrap();
 }
