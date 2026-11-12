@@ -1,5 +1,6 @@
 #![allow(clippy::only_used_in_recursion)]
 use crate::rustlight_ast::*;
+use std::borrow::Cow;
 
 mod pattern;
 
@@ -28,6 +29,46 @@ impl RustCodeGenerator {
     /// Print one modeled Rust type at the source boundary.
     pub fn generate_type_code(&self, ty: &Type) -> String {
         self.type_to_string(ty)
+    }
+
+    /// Render namespace segments for consumers that resolve paths by spelling.
+    pub fn namespace_path_segments<'a>(
+        path: &'a [String],
+        kind: &PathType,
+    ) -> Option<Cow<'a, [String]>> {
+        match kind {
+            PathType::Namespace => Some(Cow::Borrowed(path)),
+            PathType::NamespaceWithTypeArguments(arguments) => {
+                let printer = Self::new();
+                let mut segments = path.to_vec();
+                for list in arguments {
+                    let types = list.arguments
+                        .iter()
+                        .map(|ty| printer.generate_type_code(ty))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let segment = &mut segments[list.segment];
+                    *segment = format!("{segment}::<{types}>");
+                }
+                Some(Cow::Owned(segments))
+            }
+            PathType::Qualified(_) => None,
+        }
+    }
+
+    /// Render a record constructor path with its explicit type arguments.
+    pub fn generate_record_path_code(&self, path: &RecordPath) -> String {
+        match path {
+            RecordPath::Segments(segments) => segments.join("::"),
+            RecordPath::WithTypeArguments { segments, arguments } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| self.type_to_string(argument))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}::<{arguments}>", segments.join("::"))
+            }
+        }
     }
 
     /// Print an expression for placement at an existing source node.
@@ -463,13 +504,31 @@ impl RustCodeGenerator {
             Expr::Ident(id) => self.write(id),
             Expr::Macro(source) => self.write(source),
             Expr::Path(path, PathType::Namespace) => self.generate_path(path),
+            Expr::Path(path, kind @ PathType::NamespaceWithTypeArguments(_)) => {
+                let segments = Self::namespace_path_segments(path, kind)
+                    .expect("modeled type arguments are on a namespace path");
+                self.generate_path(&segments);
+            }
+            Expr::Path(path, PathType::Qualified(qualification)) => {
+                self.write("<");
+                match &qualification.self_type {
+                    QualifiedSelfType::Type(ty) => self.write(&self.type_to_string(ty)),
+                    QualifiedSelfType::Verbatim(source) => self.write(source),
+                }
+                if let Some(trait_path) = &qualification.trait_path {
+                    self.write(" as ");
+                    self.generate_path(trait_path);
+                }
+                self.write(">::");
+                self.generate_path(path);
+            }
             Expr::Field { base, member } => {
                 self.generate_postfix_base(base);
                 self.write(".");
                 self.generate_member(member);
             }
             Expr::Record { path, fields, rest } => {
-                self.generate_path(path);
+                self.write(&self.generate_record_path_code(path));
                 self.write(" {");
                 for (index, field) in fields.iter().enumerate() {
                     self.write(if index == 0 { " " } else { ", " });

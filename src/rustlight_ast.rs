@@ -207,6 +207,41 @@ impl From<String> for ClosureParam {
 #[derive(Debug, Clone)]
 pub enum PathType {
     Namespace, // separated by :: (e.g., std::thread)
+    NamespaceWithTypeArguments(Vec<PathTypeArguments>),
+    Qualified(PathQualification),
+}
+
+/// Type arguments attached to a nonterminal namespace segment.
+#[derive(Debug, Clone)]
+pub struct PathTypeArguments {
+    pub segment: usize,
+    pub arguments: Vec<Type>,
+}
+
+/// The `<T>` or `<T as Trait>` prefix of an associated expression path.
+#[derive(Debug, Clone)]
+pub struct PathQualification {
+    pub self_type: QualifiedSelfType,
+    pub trait_path: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum QualifiedSelfType {
+    Type(Box<Type>),
+    /// Preserved syntax outside the type model. Consumers cannot infer its type.
+    Verbatim(String),
+}
+
+/// A path used by a record constructor.
+#[derive(Debug, Clone)]
+pub enum RecordPath {
+    /// Namespace segments with any unmodeled argument syntax preserved.
+    Segments(Vec<String>),
+    WithTypeArguments {
+        /// The final segment contains just the constructor name.
+        segments: Vec<String>,
+        arguments: Vec<Type>,
+    },
 }
 
 /// Expression
@@ -221,7 +256,7 @@ pub enum Expr {
         member: Member,
     },
     Record {
-        path: Vec<String>,
+        path: RecordPath,
         fields: Vec<RecordField>,
         rest: Option<Box<Expr>>,
     },
@@ -237,6 +272,7 @@ pub enum Expr {
     },
     Tuple(Vec<Expr>),
     Call(Box<Expr>, Vec<Expr>),
+    /// The written method segment includes any explicit generic arguments.
     MethodCall(Box<Expr>, String, Vec<Expr>),
     Block(Block),
     LabeledBlock {

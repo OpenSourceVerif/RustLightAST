@@ -25,11 +25,9 @@ use crate::RustCodeGenerator;
 use crate::{
     AssociatedTypeBinding, Attribute, AttributeArg, Block, CallableBound, CallableTraitQualifier,
     CallableTraitType, ClosureParam, ConstDef, EnumDef, Expr, Field, FunctionDef, GenericParam,
-    Generics, ImplBlock, ImplItem, Item, LetStmt,
-    LifetimeParameter, Literal, MatchArm, Member, ModuleDecl, Param, PathType, RecordField,
-    RustModule,
-    Statement, StructDef, Type, TypeAlias, TypeParameter, UnionDef, UseKind, UseStatement, Variant,
-    Visibility, WherePredicate,
+    Generics, ImplBlock, ImplItem, Item, LetStmt, LifetimeParameter, Literal, MatchArm, Member,
+    ModuleDecl, Param, PathType, RecordField, RecordPath, RustModule, Statement, StructDef, Type,
+    TypeAlias, TypeParameter, UnionDef, UseKind, UseStatement, Variant, Visibility, WherePredicate,
 };
 
 /// Marker attached to recovered function signatures with synthetic empty bodies.
@@ -696,6 +694,21 @@ fn is_native_callable_bound_path(path: &syn::Path, module: &str, name: &str) -> 
     }
 }
 
+fn convert_type_arguments(arguments: &AngleBracketedGenericArguments) -> syn::Result<Vec<Type>> {
+    arguments
+        .args
+        .iter()
+        .map(|argument| match argument {
+            GenericArgument::Type(ty) => convert_type(ty),
+            // DEFENSE: dropping `3` from `Model<3>` may select a default const.
+            _ => Err(syn::Error::new_spanned(
+                argument,
+                "non-type generic argument is unsupported",
+            )),
+        })
+        .collect()
+}
+
 fn convert_type_path(path: &syn::Path) -> syn::Result<Type> {
     let last = path
         .segments
@@ -716,17 +729,7 @@ fn convert_type_path(path: &syn::Path) -> syn::Result<Type> {
     }
     let generic_args = match &last.arguments {
         PathArguments::None => Vec::new(),
-        PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }) => args
-            .iter()
-            .map(|arg| match arg {
-                GenericArgument::Type(ty) => convert_type(ty),
-                // DEFENSE: dropping `3` from `Model<3>` may select a default const.
-                _ => Err(syn::Error::new_spanned(
-                    arg,
-                    "non-type generic argument is unsupported",
-                )),
-            })
-            .collect::<syn::Result<Vec<_>>>()?,
+        PathArguments::AngleBracketed(arguments) => convert_type_arguments(arguments)?,
         other => {
             return Err(syn::Error::new_spanned(
                 other,
@@ -935,15 +938,22 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
         syn::Expr::MethodCall(ExprMethodCall {
             receiver,
             method,
+            turbofish,
             args,
             ..
-        }) => Ok(Expr::MethodCall(
-            Box::new(convert_expr(receiver)?),
-            method.to_string(),
-            args.iter()
-                .map(convert_expr)
-                .collect::<syn::Result<Vec<_>>>()?,
-        )),
+        }) => {
+            let method = turbofish.as_ref().map_or_else(
+                || method.to_string(),
+                |arguments| format!("{method}{}", normalize_tokens(arguments.to_token_stream())),
+            );
+            Ok(Expr::MethodCall(
+                Box::new(convert_expr(receiver)?),
+                method,
+                args.iter()
+                    .map(convert_expr)
+                    .collect::<syn::Result<Vec<_>>>()?,
+            ))
+        }
         syn::Expr::Match(ExprMatch { expr, arms, .. }) => Ok(Expr::Match {
             expr: Box::new(convert_expr(expr)?),
             arms: arms
@@ -1102,7 +1112,7 @@ pub fn convert_expr(expr: &syn::Expr) -> syn::Result<Expr> {
                 ));
             }
             Ok(Expr::Record {
-                path: path_segments(&record.path),
+                path: convert_record_path(&record.path),
                 fields: record
                     .fields
                     .iter()
@@ -1194,18 +1204,81 @@ fn convert_match_arm(arm: &syn::Arm) -> syn::Result<MatchArm> {
 }
 
 fn convert_expr_path(expr_path: &ExprPath) -> syn::Result<Expr> {
-    if expr_path.qself.is_some() {
-        return Ok(Expr::Macro(normalize_path_tokens(
-            expr_path.to_token_stream(),
-        )));
+    if let Some(qualification) = &expr_path.qself {
+        let path = &expr_path.path;
+        let trait_path = qualification.as_token.as_ref().map(|_| {
+            path.leading_colon
+                .iter()
+                .map(|_| String::new())
+                .chain(
+                    path.segments
+                        .iter()
+                        .take(qualification.position)
+                        .map(path_segment_source),
+                )
+                .collect()
+        });
+        let associated_path = path
+            .segments
+            .iter()
+            .skip(qualification.position)
+            .map(path_segment_source)
+            .collect();
+        let self_type = match convert_type(&qualification.ty) {
+            Ok(ty) => crate::QualifiedSelfType::Type(Box::new(ty)),
+            // DEFENSE: qualified expressions previously preserved unmodeled
+            // self types such as `<Model<3>>::VALUE` in their original syntax.
+            Err(_) => {
+                crate::QualifiedSelfType::Verbatim(qualification.ty.to_token_stream().to_string())
+            }
+        };
+        return Ok(Expr::Path(
+            associated_path,
+            PathType::Qualified(crate::PathQualification {
+                self_type,
+                trait_path,
+            }),
+        ));
     }
 
-    let segments = path_segments(&expr_path.path);
+    let mut segments = path_segments(&expr_path.path);
+    let type_arguments = namespace_type_arguments(&expr_path.path);
+    if !type_arguments.is_empty() {
+        let root = usize::from(expr_path.path.leading_colon.is_some());
+        for arguments in &type_arguments {
+            segments[arguments.segment] = expr_path.path.segments[arguments.segment - root]
+                .ident
+                .to_string();
+        }
+        return Ok(Expr::Path(
+            segments,
+            PathType::NamespaceWithTypeArguments(type_arguments),
+        ));
+    }
 
     match segments.as_slice() {
         [segment] => Ok(Expr::Ident(segment.clone())),
         _ => Ok(Expr::Path(segments, PathType::Namespace)),
     }
+}
+
+/// Project explicit type arguments on nonterminal expression path segments.
+pub fn namespace_type_arguments(path: &syn::Path) -> Vec<crate::PathTypeArguments> {
+    let root = usize::from(path.leading_colon.is_some());
+    path.segments
+        .iter()
+        .take(path.segments.len().saturating_sub(1))
+        .enumerate()
+        .filter_map(|(segment, source)| {
+            let PathArguments::AngleBracketed(arguments) = &source.arguments else {
+                return None;
+            };
+            Some(crate::PathTypeArguments {
+                segment: segment + root,
+                arguments: convert_type_arguments(arguments).ok()?,
+            })
+        })
+        .collect()
 }
 
 /// Lower a named or positional member at the Rust source boundary.
@@ -1229,6 +1302,24 @@ fn convert_record_field(field: &syn::FieldValue) -> syn::Result<RecordField> {
         value: convert_expr(&field.expr)?,
         shorthand: field.colon_token.is_none(),
     })
+}
+
+/// Lower final record path type arguments when they fit the type model.
+pub fn convert_record_path(path: &syn::Path) -> RecordPath {
+    if let Some(last) = path.segments.last() {
+        if let PathArguments::AngleBracketed(arguments) = &last.arguments {
+            if let Ok(arguments) = convert_type_arguments(arguments) {
+                let mut segments = path_segments(path);
+                let final_segment = segments.len() - 1;
+                segments[final_segment] = last.ident.to_string();
+                return RecordPath::WithTypeArguments {
+                    segments,
+                    arguments,
+                };
+            }
+        }
+    }
+    RecordPath::Segments(path_segments(path))
 }
 
 /// Lower a parsed Rust path into namespace segments.
@@ -1815,6 +1906,20 @@ pub fn one_bigint() -> BigInt {
         let mut generator = RustCodeGenerator::new();
         let printed = generator.generate_module_code(&module);
         assert!(printed.contains("<BigInt as One>::one()"));
+    }
+
+    #[test]
+    fn preserves_unmodeled_self_types_in_qualified_paths() {
+        let source = r#"
+pub fn values() -> (usize, usize) {
+    (<Model<3>>::VALUE, <Model<'static>::Item>::VALUE)
+}
+"#;
+        let module = parse_rust_source(source, "QSelf_Test").expect("qself paths parse");
+        let printed = RustCodeGenerator::new().generate_module_code(&module);
+        let printed: String = printed.split_whitespace().collect();
+        assert!(printed.contains("<Model<3>>::VALUE"));
+        assert!(printed.contains("<Model<'static>::Item>::VALUE"));
     }
 
     #[test]

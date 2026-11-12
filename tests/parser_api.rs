@@ -270,6 +270,46 @@ fn evaluate(mut items: Vec<(u8, u8)>, stop: bool) -> u8 {
 }
 
 #[test]
+fn record_constructor_type_arguments_can_be_rewritten() {
+    use rustlightast::{RecordPath, Statement};
+
+    let source = r#"
+struct Pending<T> { marker: std::marker::PhantomData<T> }
+fn build() {
+    let _record = Pending::<std::boxed::Box<u32>> { marker: std::marker::PhantomData };
+}
+"#;
+    let mut module = parse_rust_source(source, "record_type_arguments").unwrap();
+    let Item::Function(function) = &mut module.items[1] else {
+        panic!("expected function");
+    };
+    let Statement::Let(local) = &mut function.body.stmts[0] else {
+        panic!("expected local binding");
+    };
+    let Some(Expr::Record {
+        path: RecordPath::WithTypeArguments { arguments, .. },
+        ..
+    }) = &mut local.init
+    else {
+        panic!("expected record with explicit type arguments");
+    };
+    let [Type::Generic(name, _)] = arguments.as_mut_slice() else {
+        panic!("expected one generic type argument");
+    };
+    *name = "std::rc::Rc".into();
+
+    let mut printer = RustCodeGenerator::new();
+    let printed = printer.generate_module_code(&module);
+    assert!(printed.contains("Pending::<std::rc::Rc<u32>>"));
+    parse_rust_source(&printed, "roundtrip").unwrap();
+
+    let source = syn::parse_str("Opaque::<3> {}").unwrap();
+    let opaque = rustlightast::rustlight_parser::convert_expr(&source).unwrap();
+    let printed = printer.generate_expression_code(&opaque);
+    assert!(printed.contains("Opaque::<3>"));
+}
+
+#[test]
 fn record_fields_can_be_rewritten_without_losing_shorthand_or_update_order() {
     let source = r#"
 fn row(original: Row, tag: u8, second: u8) -> Row {
@@ -379,6 +419,25 @@ fn iterator_opaque_types_keep_the_associated_item_type() {
     assert!(printed.contains("impl IntoIterator<Item = T>"));
     assert!(printed.contains("impl Iterator<Item = &'a T>"));
     parse_rust_source(&printed, "roundtrip").unwrap();
+}
+
+#[test]
+fn explicit_method_arguments_survive_source_roundtrip() {
+    let source = "fn values() -> Vec<u32> { (0..3).collect::<Vec<_>>() }";
+    let module = rustlightast::parse_rust_source(source, "methods").unwrap();
+    let printed = rustlightast::RustCodeGenerator::new().generate_module_code(&module);
+    let file = syn::parse_file(&printed).unwrap();
+    let syn::Item::Fn(function) = &file.items[0] else {
+        panic!("expected function");
+    };
+    let syn::Stmt::Expr(syn::Expr::MethodCall(call), None) = &function.block.stmts[0] else {
+        panic!("expected method call");
+    };
+    assert_eq!(call.method, "collect");
+    assert_eq!(
+        quote::ToTokens::to_token_stream(&call.turbofish).to_string(),
+        ":: < Vec < _ > >",
+    );
 }
 
 #[test]
