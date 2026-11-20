@@ -1,13 +1,28 @@
 [package]
 name = "rustlightast"
+version.workspace = true
+edition.workspace = true
+
+[workspace]
+members = ["model"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[lints]
+workspace = true
 
 [lib]
 name = "rustlightast"
 path = "src/lib.rs"
 
 [dependencies]
-proc-macro2 = "1"
+rustlightast-model = { version = "0.1.0", path = "model" }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "2", features = ["full", "visit"] }
